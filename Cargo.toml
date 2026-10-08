@@ -1,0 +1,20 @@
+[package]
+name = "linear"
+version = "0.1.0"
+edition = "2021"
+description = "Linear on Pointman's nodes: a team's board as a pane, drawn by the apps' own board."
+license = "MIT"
+repository = "https://github.com/pointman-ai/pointman-linear"
+publish = false
+
+[dependencies]
+anyhow = "1"
+pointman-extension = { git = "https://github.com/pointman-ai/pointman-extension", rev = "05e824965dbab3d994599d8442973515afc10db2" }
+regex = "1"
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+strip = true
+lto = true

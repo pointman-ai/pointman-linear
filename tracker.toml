@@ -1,0 +1,253 @@
+# A copy of Pointman core's extensions/linear/tracker.toml, the map its Linear mirror reads, built into
+# this extension so the board pane draws Linear's states as the mirror files them. Keep the two the same.
+#
+# Linear ⇄ the board's project items: how Linear's states, levels and fields map onto the projects
+# syntax. A draft until pm's syntax spec lands (thread 2065). Only the Linear sync reads this file:
+# core's registry reads extension.toml, and Linear has none yet.
+#
+# The board's side (agreed in 2065, [2081]–[2084]):
+#   category  triage · backlog · todo · active · review · done · dropped
+#   outcome   completed · not_planned · duplicate         (done and dropped only)
+#   held      a pause a person sets on purpose: a flag on top of the category, not an eighth one.
+#             Waiting and blocked come from relations.
+#   state     the name the item's kind gives it ("Cut review"). Projects and initiatives use the
+#             same set.
+#   words     team › initiative › project › epic › task (a subtask is a task with a parent); task
+#             kinds task, bug and feature; sprints and milestones (pm [2095]). [terms] says what
+#             Linear calls each.
+#
+# Import: the first rule that matches a Linear state wins, and gives {category, outcome, held}. The
+# item keeps its kind's state of the same name if it has one, else the category's first state; the
+# Linear name is kept as x.linear.state either way.
+# Export reads (category, held): the item's state name goes to a Linear state of the same name if
+# the team has one. Else the category's list is tried in order and the first state the team has
+# wins; for (active, held), the held list instead.
+
+[tracker]
+tool = "linear"
+version = 1
+
+# The board's words and Linear's (James asked for one name per thing, 2065 [2093]: "GitHub sprints,
+# which in Linear are cycles"). The same keys are in every tool's tracker.toml.
+[terms]
+team = "Team"                      # Spark is the ALA team in the alaistudios workspace
+initiative = "Initiative"
+project = "Project"                # "Spark" is a Linear project
+epic = "Issue"                     # a parent issue marked as an epic: see [epic]
+task = "Issue"
+subtask = "Sub-issue"
+milestone = "Project milestone"    # always inside one project in Linear
+sprint = "Cycle"
+label = "Label"
+estimate = "Estimate"
+
+# Linear has no epics. Spark makes one a parent issue with its tasks as sub-issues, usually titled
+# "[EPIC] …" and labelled EPIC (about 60, e.g. https://linear.app/alaistudios/issue/ALA-1886). Some
+# have only one of the two, or an older title: "EPIC: …" (ALA-935), "Epic 3 — …" (the Autograph
+# Phase II client project). spark-triage checked them all (2065 [2100]). So an issue is an epic when
+# it has the label or a title that matches; titles are kept as they are. An epic the board makes
+# gets Spark's usual form, prefix and label.
+# Epics nest: ALA-1767 holds seven epics, so an epic under an epic stays an epic.
+# An epic takes no PR evidence: Linear's own GitHub automation closed ALA-1886 when a PR attached to
+# it merged (2 Oct), so PRs reference tasks and the epic closes when its tasks do.
+[epic]
+labels = ["EPIC"]                  # compared ignoring case
+titles = ['^\[EPIC\]', '^EPIC:', '^Epic \d+ —']
+new = { title_prefix = "[EPIC] ", label = "EPIC" }
+
+# Task kinds. Linear has no issue types, but a new workspace comes with Bug and Feature labels.
+[kinds]
+task = {}
+bug = { label = "Bug" }
+feature = { label = "Feature" }
+
+# Issues: WorkflowState {type, name}. Linear has no review or hold type: teams name them inside
+# "started", so the name decides.
+[[issue.import]]
+type = "triage"
+category = "triage"
+
+[[issue.import]]
+type = "backlog"
+category = "backlog"
+
+[[issue.import]]
+type = "unstarted"
+category = "todo"
+
+[[issue.import]]
+type = "started"
+name = "(?i)review|qa|approv|verif|sign.?off"
+category = "review"
+
+[[issue.import]]
+type = "started"
+name = "(?i)hold|pause|parked"
+category = "active"
+held = true
+
+[[issue.import]]
+type = "started"
+category = "active"
+
+[[issue.import]]
+type = "completed"
+category = "done"
+outcome = "completed"
+
+[[issue.import]]
+type = "duplicate"
+category = "dropped"
+outcome = "duplicate"
+
+[[issue.import]]
+type = "canceled"
+name = "(?i)duplicate"
+category = "dropped"
+outcome = "duplicate"
+
+[[issue.import]]
+type = "canceled"
+category = "dropped"
+outcome = "not_planned"
+
+# Board → Linear. A team with triage switched off has no triage state, so triage falls back to
+# backlog. (active, held) takes a hold-named state when the team has one. Any other held item, or
+# one on a team with no hold state, keeps its category's state and gets the "On hold" label (the
+# sync creates it: labels must exist before they sync).
+# outcome duplicate also adds Linear's duplicate relation to the original.
+[issue.export]
+triage = [{ type = "triage" }, { type = "backlog" }]
+backlog = [{ type = "backlog" }]
+todo = [{ type = "unstarted" }]
+active = [{ type = "started", not_name = "(?i)review|qa|approv|verif|sign.?off|hold|pause|parked" }, { type = "started" }]
+review = [{ type = "started", name = "(?i)review|qa|approv|verif|sign.?off" }, { type = "started" }]
+held = [{ type = "started", name = "(?i)hold|pause|parked" }, { label = "On hold" }]
+done = [{ type = "completed" }]
+dropped = [{ type = "canceled" }]
+
+# Projects: ProjectStatus types. Linear's "paused" is the board's held, kept under its own name.
+[project.import]
+backlog = { category = "backlog" }
+planned = { category = "todo" }
+started = { category = "active" }
+paused = { category = "active", held = true }
+completed = { category = "done", outcome = "completed" }
+canceled = { category = "dropped", outcome = "not_planned" }
+
+[project.export]
+triage = "backlog"                 # Linear projects have no triage
+backlog = "backlog"
+todo = "planned"
+active = "started"
+review = "started"                 # nor review: the state name stays in x.linear
+held = "paused"                    # for any held project: it comes back as (active, held)
+done = "completed"
+dropped = "canceled"
+
+# Initiatives: Planned, Active and Completed, plus Proposed and Canceled since July 2026. Linear
+# initiatives can't be paused, so held stays on the board only.
+[initiative.import]
+proposed = { category = "triage" }
+planned = { category = "todo" }
+active = { category = "active" }
+completed = { category = "done", outcome = "completed" }
+canceled = { category = "dropped", outcome = "not_planned" }
+
+[initiative.export]
+triage = "proposed"
+backlog = "planned"
+todo = "planned"
+active = "active"
+review = "active"
+done = "completed"
+dropped = "canceled"
+
+# Sprints are cycles. Linear numbers a team's cycles itself and makes them on the team's schedule,
+# so a cycle is matched to a board sprint by its dates (pm [2095]), and its number and name are
+# kept. An issue is in at most one cycle. Linear can roll unfinished issues into the next cycle on
+# its own; on a Linear-led team the board leaves that to Linear.
+[sprint]
+object = "Cycle"
+match = "dates"                    # same start and end day, in the team's time zone
+name = "name"                      # often empty: Linear then shows "Cycle 41"
+number = "number"
+start = "startsAt"
+end = "endsAt"
+goal = "description"
+item_field = "cycle"
+
+# Projects and initiatives carry health in Linear's updates.
+[health]
+onTrack = "on_track"
+atRisk = "at_risk"
+offTrack = "off_track"
+
+# Linear's 0–4; Linear calls 3 "Medium".
+[priority]
+0 = "none"
+1 = "urgent"
+2 = "high"
+3 = "normal"
+4 = "low"
+
+# Board field = Linear field. Anything not here goes to x.linear.<field> and back, untouched.
+[fields]
+title = "title"                    # a project's or initiative's is `name`
+body = "description"               # Markdown on both sides
+owner = "assignee"                 # a project's is `lead`, an initiative's `owner`. Linear only
+                                   # assigns people: an agent owner sends its person as assignee and
+                                   # itself as delegate (pm [2095])
+doers = "delegate"                 # one agent: the first agent doer; the rest stay in x.linear.doers.
+                                   # Agents are delegated, never assigned (Linear's agent guidelines)
+due = "dueDate"                    # a project's is `targetDate`
+start = "startDate"                # projects only; issues have none
+estimate = "estimate"              # a number; the team's scale goes to x.linear.estimate_scale
+labels = "labels"
+rank = "sortOrder"                 # a float; sub-issues have subIssueSortOrder (core's rank, [2098])
+parent = "parent"
+in = ["project", "cycle", "projectMilestone"]
+comments = "comments"
+links = "attachments"              # PRs, Figma, Sentry: Linear keeps outside links as attachments
+
+# Typed relations: board = Linear IssueRelation type. "blocked by" is "blocks" read the other way.
+[relations]
+blocks = "blocks"
+relates = "related"
+duplicates = "duplicate"
+
+# Who's in charge (James, 2065 [2093]): Linear stays in charge for Spark; the board is in charge
+# for our own work and open source. A team names one with led_by, as in the spec; the default here
+# is Linear.
+# - led_by = "linear": every field mapped above is Linear's. An edit made on the board is sent to
+#   Linear and only counts once Linear's webhook confirms it, so the two can't disagree. Evidence
+#   rules ask Linear to move the issue, and stay off for PRs where the team's own GitHub automation
+#   already moves issues (Spark's does).
+# - led_by = "board": the board's fields win. A change made in Linear comes in as evidence
+#   (mirror.moved), which moves the item like any other evidence, and comments go both ways.
+# The board's own fields (evidence, runs, cost, appetite, hill, held reasons) are never sent.
+[led_by]
+default = "linear"
+
+[led_by.board]
+state = "board"
+sprint = "board"
+rank = "board"
+parent = "board"
+owner = "board"
+priority = "board"
+due = "board"
+title = "both"                     # last write wins, field by field
+body = "both"
+labels = "both"
+comments = "both"
+relations = "both"
+
+# Linear's webhooks send create, update and remove. An update carries updatedFrom (the previous
+# values), so each change arrives as {field, from, to}. Echoes: a change the sync made itself comes
+# back as a webhook and is dropped when it matches what the sync last wrote. A poll on updatedAt
+# catches anything a delivery missed.
+[events]
+webhooks = ["Issue", "Comment", "IssueLabel", "Attachment", "Project", "ProjectUpdate",
+            "Initiative", "InitiativeUpdate", "Cycle", "AgentSessionEvent"]
+reconcile_minutes = 15

@@ -1,0 +1,81 @@
+# The extension's release (extension.toml: `runtime = "binary"`, `command = ["bin/<id>"]`; Pointman's
+# docs/dev/extensions.md, "Compiled extensions").
+#
+# Push a tag that's extension.toml's version (`git tag v0.7.0 && git push origin v0.7.0`): each
+# platform is built on its own runner and packed as <id>-<version>-<platform>.tar.gz, the files at
+# its top (extension.toml, bin/<id>, README.md, LICENSE). Then one job makes the release with every
+# archive attached. gh keeps it a draft until they're all up, so core's `released` delivery finds
+# each platform in `platforms`; one missing is refused.
+#
+# Linux builds are musl, so static: they run on any distribution, NixOS included, whose loader
+# isn't where a glibc build looks for it. Both Macs build on macos-14, the Intel one cross-compiled
+# (GitHub retired its macos-13 runners), so that's the one build whose tests don't run.
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  BIN: ""                 # the cargo binary's name, when it isn't the extension's id
+
+jobs:
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { platform: macos-arm64, runner: macos-14, target: aarch64-apple-darwin, test: true }
+          - { platform: macos-x86_64, runner: macos-14, target: x86_64-apple-darwin, test: false }
+          - { platform: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, test: true }
+          - { platform: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, test: true }
+    runs-on: ${{ matrix.runner }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Its id and version, and the tag's
+        run: |
+          id=$(sed -n 's/^id = "\(.*\)"/\1/p' extension.toml | head -1)
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' extension.toml | head -1)
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "the tag is $GITHUB_REF_NAME but extension.toml's version is $version" >&2
+            exit 1
+          fi
+          echo "ID=$id" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+      - if: matrix.test
+        run: cargo test --locked --target ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Pack ${{ matrix.platform }}
+        run: |
+          mkdir -p pkg/bin
+          cp "target/${{ matrix.target }}/release/${BIN:-$ID}" "pkg/bin/$ID"
+          chmod 755 "pkg/bin/$ID"
+          cp extension.toml README.md LICENSE pkg/
+          tar -czf "$ID-$VERSION-${{ matrix.platform }}.tar.gz" -C pkg extension.toml bin README.md LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: "*.tar.gz"
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: The release, with every platform's build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes

@@ -1,0 +1,69 @@
+# Linear on Pointman's machines (MB-343, Pointman's docs/dev/panes.md): a Linear team's board as a pane the
+# apps draw with their own board, the same columns, cards and drag as Pointman's projects. A move, a rank or
+# an edit goes to Linear, and the card settles where Linear puts it; Linear's no snaps it back with why.
+# Linear is asked with the vault's API key (`/linear add`), from the node, so the apps never hold it.
+[extension]
+id = "linear"
+name = "Linear"
+version = "0.1.0"
+publisher = "aurelio"
+summary = "A Linear team's board in the apps, drawn by Pointman's own board: moves, ranks and edits go to Linear."
+node = ">=0.1,<1"
+platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
+
+[run]
+command = ["bin/linear"]
+runtime = "binary"
+
+[permissions]
+network = true
+secrets = ["linear.*"]           # each workspace's API key, kept in the vault as linear.<label>
+
+# a Linear API key for every node: linear.app › Settings › Security & access › Personal API keys
+[[credentials]]
+id = "account"
+title = "Linear API key"
+help = "A personal API key from linear.app: Settings › Security & access › New API key. Pointman asks Linear as its owner."
+item = "linear.{label}"
+value = "lin_api_[A-Za-z0-9]{40}"
+placeholder = "lin_api_…"
+needed = 1
+
+[settings]
+type = "object"
+
+[settings.properties.team]
+type = "string"
+default = ""
+description = "The team whose board opens from the menu, by its key (ALA)"
+
+[settings.properties.project]
+type = "string"
+default = ""
+description = "Only this Linear project's issues, by its name; empty for the whole team"
+
+[settings.properties.refresh_seconds]
+type = "integer"
+default = 60
+description = "How often an open board asks Linear what changed"
+
+[settings.properties.api_url]
+type = "string"
+default = "https://api.linear.app/graphql"
+description = "Linear's GraphQL endpoint"
+
+[[commands]]
+kind = "linear.add"
+title = "Add a Linear API key"
+params = { type = "object", properties = { name = { type = "string", description = "What to call it (work): lowercase letters, digits, . _ -" } } }
+slash = "add"
+form = "account"
+summary = "Add a Linear API key for every node"
+
+# a team's board (Pointman's docs/dev/panes.md, "Boards"): opened with {team, project?}, or from the apps'
+# menu with the settings' team
+[[panes]]
+id = "board"
+title = "Linear"
+format = "board"
+opens = ["menu", "command"]
