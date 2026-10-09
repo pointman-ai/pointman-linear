@@ -1,14 +1,14 @@
 //! The extension's process: the node starts it (`bin/linear`, from the extension's folder) and talks to it
-//! over stdin and stdout. The `board` pane is a Linear team's board, drawn by the apps' own board; a move,
+//! over stdin and stdout. The `board` pane is a Linear team's or project's board, drawn by the apps' own board; a move,
 //! a rank or an edit goes to Linear, and every open board asks Linear what changed every minute.
-//! `linear.teams` lists the teams it can open, for the apps' Add a project board.
+//! `linear.boards` lists the teams and projects it can open, for the apps' Add a project board.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
-use linear::{board, by_id, edit_input, newest, sort_between, targets, Linear, Team, Tracker, CONTENT_MAX};
+use anyhow::{bail, Context};
+use linear::{board, by_id, edit_input, newest, sort_between, targets, Linear, Scope, Tracker, CONTENT_MAX};
 use pointman_extension::{Extension, Handle, Job, Pane, Refused};
 use regex::Regex;
 use serde_json::{json, Value};
@@ -60,10 +60,9 @@ impl Vault {
     }
 }
 
-/// One open board: which team and project, and Linear's issues as last seen.
+/// One open board: which team or project, and Linear's issues as last seen.
 struct Shown {
-    team: Team,
-    project: Option<String>,
+    scope: Scope,
     issues: HashMap<String, Value>,
     since: Option<String>,
     looked: Instant,
@@ -91,21 +90,25 @@ impl Boards {
     }
 
     fn content(&self, shown: &Shown) -> Value {
-        board(&self.map, &shown.team, shown.project.as_deref(), &shown.issues, CONTENT_MAX)
+        board(&self.map, &shown.scope, &shown.issues, CONTENT_MAX)
     }
 
-    /// pane.open: the team (and maybe one of its projects) from the target, a connected project's.
+    /// pane.open: a team or a Linear project, from the target (a connected project's): {team: key} or
+    /// {project: id}.
     fn opened(&self, p: &Pane) -> anyhow::Result<Value> {
         let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
-        let team_key = text(&p.target()["team"])
-            .context("which Linear team? Open the board with {team: \"ALA\"}: /linear teams lists them")?;
-        let project = text(&p.target()["project"]);
         let linear = self.linear()?;
-        let team = linear.team(&team_key)?;
-        let issues = by_id(linear.issues(&team.key, project.as_deref(), None)?);
-        let title = format!("{} · Linear", project.as_deref().unwrap_or(&team.name));
-        let shown =
-            Shown { team, project, since: newest(&issues), issues, looked: Instant::now(), whole: Instant::now() };
+        let scope = match (text(&p.target()["team"]), text(&p.target()["project"])) {
+            (Some(team), None) => linear.team(&team)?,
+            (None, Some(project)) => linear.project(&project)?,
+            _ => bail!(
+                "which Linear team or project? Open the board with {{team: \"ALA\"}} or {{project: id}}: \
+                        /linear boards lists them"
+            ),
+        };
+        let issues = by_id(linear.issues(&scope.filter, None)?);
+        let title = format!("{} · Linear", scope.name);
+        let shown = Shown { scope, since: newest(&issues), issues, looked: Instant::now(), whole: Instant::now() };
         let content = self.content(&shown);
         self.open().insert(p.id().to_string(), shown);
         Ok(json!({"title": title, "board": content}))
@@ -117,7 +120,7 @@ impl Boards {
         let kind = event["kind"].as_str().unwrap_or_default();
         let item = event["item"].as_str().unwrap_or_default().to_string();
         let refuse = |why: String| -> anyhow::Result<()> { Err(Refused::new(why).into()) };
-        let (issue, team) = {
+        let (issue, scope) = {
             let open = self.open();
             let Some(shown) = open.get(p.id()) else { return refuse("this board is closed".into()) };
             let Some(issue) = shown.issues.get(&item).cloned() else {
@@ -126,12 +129,16 @@ impl Boards {
                     other => refuse(format!("{other} isn't something a board does")),
                 };
             };
-            (issue, shown.team.clone())
+            (issue, shown.scope.clone())
         };
         let input = match kind {
             "open" => return Ok(()), // the app opens the card, and Linear from its url
             "move" => {
+                // the issue's own team's state by that name: a project's issues can be in several teams
                 let to = event["to"].as_str().unwrap_or_default();
+                let Some(team) = scope.teams.iter().find(|t| issue["team"]["id"] == t.id.as_str()) else {
+                    return refuse(format!("{item}'s team isn't on this board"));
+                };
                 match team.states.iter().find(|s| s["name"] == to) {
                     Some(state) => json!({"stateId": state["id"]}),
                     None => return refuse(format!("{to} isn't one of {}'s states", team.key)),
@@ -146,11 +153,12 @@ impl Boards {
                 let column: Vec<Value> = {
                     let open = self.open();
                     let shown = open.get(p.id()).context("this board is closed")?;
-                    let state = shown.issues.get(next_to).map(|i| i["state"]["id"].clone());
+                    // the column: its state's name, which teams in a project share
+                    let state = shown.issues.get(next_to).map(|i| i["state"]["name"].clone());
                     shown
                         .issues
                         .values()
-                        .filter(|i| i["id"] != item.as_str() && Some(&i["state"]["id"]) == state.as_ref())
+                        .filter(|i| i["id"] != item.as_str() && Some(&i["state"]["name"]) == state.as_ref())
                         .cloned()
                         .collect()
                 };
@@ -191,10 +199,10 @@ impl Boards {
                     continue;
                 }
                 let whole = shown.whole.elapsed() >= WHOLE_EVERY;
-                (shown.team.key.clone(), shown.project.clone(), if whole { None } else { shown.since.clone() })
+                (shown.scope.filter.clone(), if whole { None } else { shown.since.clone() })
             };
-            let (team, project, since) = due;
-            let got = self.linear().and_then(|l| l.issues(&team, project.as_deref(), since.as_deref()));
+            let (filter, since) = due;
+            let got = self.linear().and_then(|l| l.issues(&filter, since.as_deref()));
             let mut open = self.open();
             let Some(shown) = open.get_mut(p.id()) else { continue };
             shown.looked = Instant::now();
@@ -227,19 +235,22 @@ fn main() -> anyhow::Result<()> {
     });
 
     // what a project can be connected to (Pointman's Project pane, MB-378; the board's `targets`): the
-    // teams the key sees, each as the target the board opens by
+    // teams and the open Linear projects the key sees, each as the target the board opens by
     let b = boards.clone();
-    ext.command("linear.teams", move |_: &Job| {
-        let teams = targets(&b.linear()?.teams()?);
-        let names: Vec<String> = teams
+    ext.command("linear.boards", move |_: &Job| {
+        let linear = b.linear()?;
+        let (teams, projects) = (linear.teams()?, linear.projects()?);
+        let listed = |names: Vec<String>, what: &str| match names.len() {
+            0 => format!("No Linear {what}s"),
+            n => format!("{n} Linear {what}{}: {}", if n == 1 { "" } else { "s" }, names.join(", ")),
+        };
+        let team_names = teams
             .iter()
             .map(|t| format!("{} ({})", t["name"].as_str().unwrap_or_default(), t["key"].as_str().unwrap_or_default()))
             .collect();
-        let text = match names.len() {
-            0 => "This Linear key sees no teams.".to_string(),
-            n => format!("{n} Linear team{}: {}", if n == 1 { "" } else { "s" }, names.join(", ")),
-        };
-        Ok(json!({"targets": teams, "text": text}))
+        let project_names = projects.iter().filter_map(|p| p["name"].as_str()).map(String::from).collect();
+        let text = format!("{}. {}.", listed(team_names, "team"), listed(project_names, "project"));
+        Ok(json!({"targets": targets(&teams, &projects), "text": text}))
     });
 
     let b = boards.clone();

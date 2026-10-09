@@ -1,5 +1,5 @@
-//! A Linear team's board as Pointman's own board draws it (Pointman's docs/dev/panes.md, "Boards"; MB-343):
-//! Linear's workflow states as columns in the projects syntax's seven categories, its issues as cards, and
+//! A Linear team's or project's board as Pointman's own board draws it (Pointman's docs/dev/panes.md,
+//! "Boards"; MB-343): Linear's workflow states as columns in the projects syntax's seven categories, its issues as cards, and
 //! its cycles as sprints, through core's map (tracker.toml, the one its Linear mirror reads). Linear is
 //! asked with the vault's API key, over its GraphQL API.
 //!
@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! {project: {key, title, leading_tool: "linear", note?},
-//!  states: [{name, category}],                       // the team's, in Linear's order
+//!  states: [{name, category}],                       // the teams', in Linear's order
 //!  items: [{id, ref, level, kind, title, state, category, owner, parent, sprint, target, priority,
 //!           rank, url}],                             // open issues, and those closed in the last 14 days
 //!  groups: {sprints: [{id, name, start, end}], milestones: [{id, name, target}]}}
@@ -29,7 +29,7 @@ const CLOSED_DAYS: u32 = 14;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const ISSUE_FIELDS: &str = "id identifier title priority dueDate url updatedAt sortOrder \
-    state { id name type } assignee { name displayName } labels { nodes { name } } parent { identifier } \
+    team { id } state { id name type } assignee { name displayName } labels { nodes { name } } parent { identifier } \
     cycle { id number name startsAt endsAt } projectMilestone { id name targetDate }";
 
 /// Linear's 0–4, as the projects syntax says them (tracker.toml's [priority]; Linear calls 3 "Medium").
@@ -139,6 +139,20 @@ pub struct Linear {
     agent: ureq::Agent,
 }
 
+/// What a board shows: one team's issues, or a Linear project's, across the teams it has.
+#[derive(Clone, Debug)]
+pub struct Scope {
+    /// The board's project key: the team's, or one from the project's name.
+    pub key: String,
+    pub name: String,
+    /// Its issues, as Linear's IssueFilter.
+    pub filter: Value,
+    pub teams: Vec<Team>,
+}
+
+const TEAM_FIELDS: &str = "id key name states { nodes { id name type position } } \
+    cycles(first: 50, filter: {endsAt: {gt: \"-P60D\"}}) { nodes { id number name startsAt endsAt } }";
+
 /// A team, as the board needs it: its states in Linear's order, and its recent cycles.
 #[derive(Clone, Debug)]
 pub struct Team {
@@ -190,26 +204,36 @@ impl Linear {
         Ok(body["data"].clone())
     }
 
-    pub fn team(&self, key: &str) -> anyhow::Result<Team> {
+    /// A team's board, by its key.
+    pub fn team(&self, key: &str) -> anyhow::Result<Scope> {
         let data = self.gql(
-            "query($key: String!) { teams(filter: {key: {eq: $key}}) { nodes { id key name \
-               states { nodes { id name type position } } \
-               cycles(first: 50, filter: {endsAt: {gt: \"-P60D\"}}) { nodes { id number name startsAt endsAt } } } } }",
+            &format!("query($key: String!) {{ teams(filter: {{key: {{eq: $key}}}}) {{ nodes {{ {TEAM_FIELDS} }} }} }}"),
             json!({"key": key}),
         )?;
-        let t =
-            data["teams"]["nodes"].get(0).cloned().ok_or_else(|| anyhow!("Linear has no team {key} for this key"))?;
-        let mut states = t["states"]["nodes"].as_array().cloned().unwrap_or_default();
-        states.sort_by(|a, b| a["position"].as_f64().unwrap_or(0.0).total_cmp(&b["position"].as_f64().unwrap_or(0.0)));
-        let mut cycles = t["cycles"]["nodes"].as_array().cloned().unwrap_or_default();
-        cycles
-            .sort_by(|a, b| a["startsAt"].as_str().unwrap_or_default().cmp(b["startsAt"].as_str().unwrap_or_default()));
-        Ok(Team {
-            id: t["id"].as_str().unwrap_or_default().to_string(),
-            key: t["key"].as_str().unwrap_or(key).to_string(),
-            name: t["name"].as_str().unwrap_or(key).to_string(),
-            states,
-            cycles,
+        let t = data["teams"]["nodes"].get(0).ok_or_else(|| anyhow!("Linear has no team {key} for this key"))?;
+        let team = team_of(t);
+        Ok(Scope {
+            key: team.key.clone(),
+            name: team.name.clone(),
+            filter: json!({"team": {"key": {"eq": team.key}}}),
+            teams: vec![team],
+        })
+    }
+
+    /// A Linear project's board, by its id: its issues from every team it has.
+    pub fn project(&self, id: &str) -> anyhow::Result<Scope> {
+        let data = self.gql(
+            &format!("query($id: String!) {{ project(id: $id) {{ id name teams {{ nodes {{ {TEAM_FIELDS} }} }} }} }}"),
+            json!({"id": id}),
+        )?;
+        let p = &data["project"];
+        let name = p["name"].as_str().ok_or_else(|| anyhow!("Linear has no project {id} for this key"))?;
+        let teams: Vec<Team> = p["teams"]["nodes"].as_array().into_iter().flatten().map(team_of).collect();
+        Ok(Scope {
+            key: key_for(name).unwrap_or_else(|| teams.first().map(|t| t.key.clone()).unwrap_or_default()),
+            name: name.to_string(),
+            filter: json!({"project": {"id": {"eq": p["id"]}}}),
+            teams,
         })
     }
 
@@ -221,13 +245,29 @@ impl Linear {
         Ok(teams)
     }
 
-    /// The team's issues for its board: open ones, and those closed in the last 14 days. With `since`,
-    /// only those updated after it, closed or not (what changed since the last look).
-    pub fn issues(&self, team: &str, project: Option<&str>, since: Option<&str>) -> anyhow::Result<Vec<Value>> {
-        let mut filter = json!({"team": {"key": {"eq": team}}});
-        if let Some(project) = project.filter(|p| !p.is_empty()) {
-            filter["project"] = json!({"name": {"eq": project}});
+    /// Every Linear project the key sees that isn't completed or canceled, by name.
+    pub fn projects(&self) -> anyhow::Result<Vec<Value>> {
+        let query = "query($after: String) { projects(first: 100, after: $after, \
+                       filter: {status: {type: {nin: [\"completed\", \"canceled\"]}}}) { \
+                       nodes { id name } pageInfo { hasNextPage endCursor } } }";
+        let (mut out, mut after) = (Vec::new(), Value::Null);
+        for _ in 0..PAGES {
+            let page = self.gql(query, json!({"after": after}))?;
+            let projects = &page["projects"];
+            out.extend(projects["nodes"].as_array().cloned().unwrap_or_default());
+            if projects["pageInfo"]["hasNextPage"] != true {
+                break;
+            }
+            after = projects["pageInfo"]["endCursor"].clone();
         }
+        out.sort_by(|a, b| a["name"].as_str().unwrap_or_default().cmp(b["name"].as_str().unwrap_or_default()));
+        Ok(out)
+    }
+
+    /// A board's issues (its scope's filter): open ones, and those closed in the last 14 days. With
+    /// `since`, only those updated after it, closed or not (what changed since the last look).
+    pub fn issues(&self, scope: &Value, since: Option<&str>) -> anyhow::Result<Vec<Value>> {
+        let mut filter = scope.clone();
         match since {
             Some(since) => filter["updatedAt"] = json!({"gt": since}),
             None => {
@@ -289,23 +329,25 @@ pub fn item(map: &Tracker, issue: &Value) -> Value {
     })
 }
 
-/// The board for a team (and maybe one of its projects), from its issues by id, cut to `max` bytes: the
-/// longest-closed issues go first, then the least recently changed, and the project says how many.
-pub fn board(map: &Tracker, team: &Team, project: Option<&str>, issues: &HashMap<String, Value>, max: usize) -> Value {
-    let title = match project.filter(|p| !p.is_empty()) {
-        Some(p) => format!("{p} · {}", team.name),
-        None => team.name.clone(),
-    };
-    let states: Vec<Value> = team
-        .states
-        .iter()
-        .map(|s| {
-            let name = s["name"].as_str().unwrap_or_default();
-            json!({"name": name, "category": map.category(s["type"].as_str().unwrap_or_default(), name)})
-        })
-        .collect();
-    let sprints: Vec<Value> = team
-        .cycles
+/// The board for a team or a project, from its issues by id, cut to `max` bytes: the longest-closed
+/// issues go first, then the least recently changed, and the project says how many. A project across
+/// teams has each team's states as columns, by name, the first team's order first.
+pub fn board(map: &Tracker, scope: &Scope, issues: &HashMap<String, Value>, max: usize) -> Value {
+    let mut states: Vec<Value> = Vec::new();
+    for s in scope.teams.iter().flat_map(|t| &t.states) {
+        let name = s["name"].as_str().unwrap_or_default();
+        if !states.iter().any(|x| x["name"] == name) {
+            states.push(json!({"name": name, "category": map.category(s["type"].as_str().unwrap_or_default(), name)}));
+        }
+    }
+    let mut cycles: Vec<&Value> = Vec::new();
+    for c in scope.teams.iter().flat_map(|t| &t.cycles) {
+        if !cycles.iter().any(|x| x["id"] == c["id"]) {
+            cycles.push(c);
+        }
+    }
+    cycles.sort_by(|a, b| a["startsAt"].as_str().unwrap_or_default().cmp(b["startsAt"].as_str().unwrap_or_default()));
+    let sprints: Vec<Value> = cycles
         .iter()
         .map(|c| {
             let name = c["name"].as_str().filter(|n| !n.is_empty()).map(String::from);
@@ -333,7 +375,7 @@ pub fn board(map: &Tracker, team: &Team, project: Option<&str>, issues: &HashMap
     });
     let mut items: Vec<Value> = ordered.into_iter().map(|i| item(map, i)).collect();
     let mut out = json!({
-        "project": {"key": team.key, "title": title, "leading_tool": "linear"},
+        "project": {"key": scope.key, "title": scope.name, "leading_tool": "linear"},
         "states": states, "items": [], "groups": {"sprints": sprints, "milestones": milestones},
     });
     let mut size = serde_json::to_vec(&out).map_or(0, |b| b.len()) + 200;
@@ -356,15 +398,50 @@ pub fn board(map: &Tracker, team: &Team, project: Option<&str>, issues: &HashMap
 }
 
 /// What the board opens by, for the apps' Add a project board (Pointman's MB-376–378): each team as
-/// `{target: {team}, name, key}`, `key` the project key it suggests (the team's own).
-pub fn targets(teams: &[Value]) -> Vec<Value> {
-    teams
-        .iter()
-        .filter_map(|t| {
-            let key = t["key"].as_str()?;
-            Some(json!({"target": {"team": key}, "name": t["name"].as_str().unwrap_or(key), "key": key}))
-        })
-        .collect()
+/// `{target: {team}, name, key, kind: "team"}`, then each Linear project as `{target: {project: id}, name,
+/// key, kind: "project"}`. `key` is the project key it suggests: a team's own, or one from a project's name.
+pub fn targets(teams: &[Value], projects: &[Value]) -> Vec<Value> {
+    let teams = teams.iter().filter_map(|t| {
+        let key = t["key"].as_str()?;
+        Some(json!({"target": {"team": key}, "name": t["name"].as_str().unwrap_or(key), "key": key, "kind": "team"}))
+    });
+    let projects = projects.iter().filter_map(|p| {
+        let (id, name) = (p["id"].as_str()?, p["name"].as_str()?);
+        Some(json!({"target": {"project": id}, "name": name, "key": key_for(name), "kind": "project"}))
+    });
+    teams.chain(projects).collect()
+}
+
+/// A project key from a name, as the apps suggest one (2–10 capitals and digits, a letter first): its
+/// words' first letters (Admin Panel Rinse: APR), or a one-word name's first three (Spark: SPA).
+pub fn key_for(name: &str) -> Option<String> {
+    let words: Vec<String> = name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_uppercase)
+        .collect();
+    let initials: String = words.iter().filter_map(|w| w.chars().next()).collect();
+    let key: String = if words.len() > 1 && initials.len() >= 2 {
+        initials.chars().take(10).collect()
+    } else {
+        words.first()?.chars().take(3).collect()
+    };
+    Regex::new(r"^[A-Z][A-Z0-9]{1,9}$").ok()?.is_match(&key).then_some(key)
+}
+
+fn team_of(t: &Value) -> Team {
+    let mut states = t["states"]["nodes"].as_array().cloned().unwrap_or_default();
+    states.sort_by(|a, b| a["position"].as_f64().unwrap_or(0.0).total_cmp(&b["position"].as_f64().unwrap_or(0.0)));
+    let mut cycles = t["cycles"]["nodes"].as_array().cloned().unwrap_or_default();
+    cycles.sort_by(|a, b| a["startsAt"].as_str().unwrap_or_default().cmp(b["startsAt"].as_str().unwrap_or_default()));
+    let key = t["key"].as_str().unwrap_or_default();
+    Team {
+        id: t["id"].as_str().unwrap_or_default().to_string(),
+        key: key.to_string(),
+        name: t["name"].as_str().unwrap_or(key).to_string(),
+        states,
+        cycles,
+    }
 }
 
 /// Where an issue goes between its neighbours in its column: the sortOrder that puts it just before or
@@ -470,6 +547,16 @@ mod tests {
     }
 
     #[test]
+    fn project_keys_come_from_names() {
+        assert_eq!(key_for("Admin Panel Rinse").as_deref(), Some("APR"));
+        assert_eq!(key_for("Spark").as_deref(), Some("SPA"));
+        assert_eq!(key_for("2026 launch"), None); // a key starts with a letter
+        assert_eq!(key_for("Q4").as_deref(), Some("Q4"));
+        assert_eq!(key_for("A b c d e f g h i j k l").as_deref(), Some("ABCDEFGHIJ"));
+        assert_eq!(key_for("—"), None);
+    }
+
+    #[test]
     fn the_board_has_the_teams_states_and_its_issues() {
         let map = Tracker::default();
         let team = Team {
@@ -488,8 +575,9 @@ mod tests {
         a["projectMilestone"] = json!({"id": "m1", "name": "Beta", "targetDate": "2026-11-01"});
         let b = issue("2", ("completed", "Done"), 2.0, "2026-10-07T00:00:00.000Z");
         let issues = by_id(vec![a, b]);
-        let board = board(&map, &team, Some("Voice"), &issues, CONTENT_MAX);
-        assert_eq!(board["project"], json!({"key": "ALA", "title": "Voice · Spark", "leading_tool": "linear"}));
+        let scope = Scope { key: "V".into(), name: "Voice".into(), filter: json!({}), teams: vec![team.clone()] };
+        let board = board(&map, &scope, &issues, CONTENT_MAX);
+        assert_eq!(board["project"], json!({"key": "V", "title": "Voice", "leading_tool": "linear"}));
         assert_eq!(
             board["states"],
             json!([{"name": "Todo", "category": "todo"}, {"name": "In Review", "category": "review"}])
@@ -507,9 +595,9 @@ mod tests {
         );
         assert_eq!(board["groups"]["milestones"], json!([{"id": "m1", "name": "Beta", "target": "2026-11-01"}]));
         // cut to fit: the closed issue goes first
-        let open_only = super::board(&map, &team, None, &by_id(vec![issues["1"].clone()]), CONTENT_MAX);
+        let open_only = super::board(&map, &scope, &by_id(vec![issues["1"].clone()]), CONTENT_MAX);
         let max = serde_json::to_vec(&open_only).unwrap().len() + 200 + 5;
-        let small = super::board(&map, &team, None, &issues, max);
+        let small = super::board(&map, &scope, &issues, max);
         assert_eq!(small["items"].as_array().unwrap().len(), 1);
         assert_eq!(small["items"][0]["ref"], "ALA-1");
         assert_eq!(small["project"]["note"], "1 older issue left out: Linear has them");

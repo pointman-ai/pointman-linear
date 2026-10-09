@@ -1,6 +1,7 @@
 //! The extension against a stand-in node (pointman-extension's testing::StandIn), started as a node starts
 //! it, with a stand-in Linear: a GraphQL server on a free local port that answers as Linear's API would,
-//! for one team's board (ALA, among two teams), and keeps the changes it's asked to make.
+//! for two teams (ALA and OPS, each with its own states) and a project across both, and keeps the changes
+//! it's asked to make.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -37,21 +38,54 @@ fn states() -> Vec<Value> {
     ]
 }
 
+/// OPS's own workflow: a Todo and a Done of its own, and Doing, which ALA hasn't.
+fn ops_states() -> Vec<Value> {
+    ["Todo", "Doing", "Done"]
+        .iter()
+        .zip(["unstarted", "started", "completed"])
+        .enumerate()
+        .map(|(i, (name, kind))| json!({"id": format!("ops-{name}"), "name": name, "type": kind, "position": i as f64}))
+        .collect()
+}
+
+fn team(id: &str, key: &str, name: &str, states: Vec<Value>) -> Value {
+    json!({"id": id, "key": key, "name": name, "states": {"nodes": states},
+           "cycles": {"nodes": [{"id": "cy-41", "number": 41, "name": null, "startsAt": "2026-10-05T00:00:00.000Z",
+                                 "endsAt": "2026-10-19T00:00:00.000Z"}]}})
+}
+
+fn teams() -> Vec<Value> {
+    vec![team("team-1", "ALA", "Spark", states()), team("team-2", "OPS", "Operations", ops_states())]
+}
+
 fn issue(n: u32, state_name: &str, order: f64) -> Value {
     let st = states().into_iter().find(|s| s["name"] == state_name).unwrap();
     json!({"id": format!("lin_{n}"), "identifier": format!("ALA-{n}"), "title": format!("Issue {n}"), "priority": 3,
            "dueDate": null, "url": format!("https://linear.app/alai/issue/ALA-{n}"),
            "updatedAt": format!("2026-10-08T10:00:{n:02}.000Z"), "sortOrder": order,
-           "state": {"id": st["id"], "name": st["name"], "type": st["type"]},
+           "team": {"id": "team-1"}, "state": {"id": st["id"], "name": st["name"], "type": st["type"]},
            "assignee": {"name": "James Briggs", "displayName": "james"}, "labels": {"nodes": []},
-           "parent": null, "cycle": null, "projectMilestone": null})
+           "parent": null, "cycle": null, "projectMilestone": null, "project": null})
+}
+
+/// An OPS issue, in the Spark Voice project.
+fn ops_issue(n: u32, state_name: &str) -> Value {
+    let st = ops_states().into_iter().find(|s| s["name"] == state_name).unwrap();
+    let mut i = issue(n, "Todo", 1.0);
+    i["identifier"] = json!(format!("OPS-{n}"));
+    i["team"] = json!({"id": "team-2"});
+    i["state"] = json!({"id": st["id"], "name": st["name"], "type": st["type"]});
+    i["project"] = json!({"id": "proj-1"});
+    i
 }
 
 impl Fake {
     fn answer(&mut self, body: &Value) -> (u16, Value) {
         let query = body["query"].as_str().unwrap_or_default();
         let vars = &body["variables"];
-        let word = query.split(|c: char| !c.is_alphanumeric()).find(|w| ["teams", "issues", "issueUpdate"].contains(w));
+        let word = query
+            .split(|c: char| !c.is_alphanumeric())
+            .find(|w| ["teams", "projects", "project", "issues", "issueUpdate"].contains(w));
         self.calls.push((word.unwrap_or("?").to_string(), vars.clone()));
         match word {
             Some("teams") if vars["key"].is_null() => (
@@ -60,23 +94,43 @@ impl Fake {
                                                     {"id": "team-2", "key": "OPS", "name": "Operations"}]}}}),
             ),
             Some("teams") => {
-                if vars["key"] != "ALA" {
-                    return (200, json!({"data": {"teams": {"nodes": []}}}));
-                }
+                let found: Vec<Value> = teams().into_iter().filter(|t| t["key"] == vars["key"]).collect();
+                (200, json!({"data": {"teams": {"nodes": found}}}))
+            }
+            Some("projects") => {
+                // the status filter is in the query's text: completed and canceled ones aren't listed
+                let listed = |status: &str| !query.contains(&format!("\"{status}\""));
+                let nodes: Vec<Value> = [("proj-1", "Spark Voice", "started"), ("proj-2", "Old Launch", "completed")]
+                    .iter()
+                    .filter(|(_, _, status)| listed(status))
+                    .map(|(id, name, _)| json!({"id": id, "name": name}))
+                    .collect();
                 (
                     200,
-                    json!({"data": {"teams": {"nodes": [{"id": "team-1", "key": "ALA", "name": "Spark",
-                    "states": {"nodes": states()},
-                    "cycles": {"nodes": [{"id": "cy-41", "number": 41, "name": null, "startsAt": "2026-10-05T00:00:00.000Z",
-                                          "endsAt": "2026-10-19T00:00:00.000Z"}]}}]}}}),
+                    json!({"data": {"projects": {"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}}}}),
                 )
             }
+            Some("project") if vars["id"] == "proj-1" => (
+                200,
+                json!({"data": {"project": {"id": "proj-1", "name": "Spark Voice", "teams": {"nodes": teams()}}}}),
+            ),
+            Some("project") => (
+                200,
+                json!({"errors": [{"message": "Entity not found: Project",
+                                   "extensions": {"userPresentableMessage": "Could not find referenced Project."}}]}),
+            ),
             Some("issues") => {
-                let since = vars["filter"]["updatedAt"]["gt"].as_str();
+                let filter = &vars["filter"];
+                let since = filter["updatedAt"]["gt"].as_str();
+                let team = filter["team"]["key"]["eq"].as_str();
+                let project = &filter["project"]["id"]["eq"];
+                let team_of = |i: &Value| if i["team"]["id"] == "team-2" { "OPS" } else { "ALA" };
                 let nodes: Vec<Value> = self
                     .issues
                     .iter()
                     .filter(|i| since.is_none_or(|s| i["updatedAt"].as_str().unwrap() > s))
+                    .filter(|i| team.is_none_or(|t| team_of(i) == t))
+                    .filter(|i| project.is_null() || i["project"]["id"] == *project)
                     .cloned()
                     .collect();
                 (
@@ -102,7 +156,7 @@ impl Fake {
                 };
                 let input = &vars["input"];
                 if let Some(st) = input["stateId"].as_str() {
-                    let s = states().into_iter().find(|s| s["id"] == st).unwrap();
+                    let s = states().into_iter().chain(ops_states()).find(|s| s["id"] == st).unwrap();
                     it["state"] = json!({"id": s["id"], "name": s["name"], "type": s["type"]});
                 }
                 for (from, to) in
@@ -128,6 +182,7 @@ fn linear() -> (String, Arc<Mutex<Fake>>) {
             issue(2, "In Progress", 2.0),
             issue(3, "In Review", 1.0),
             issue(4, "Done", 1.0),
+            ops_issue(6, "Todo"),
         ],
         calls: vec![],
         refuse: None,
@@ -322,9 +377,11 @@ fn a_board_that_cant_open_says_why() {
     assert_eq!(e.message, "Linear refused the API key (401): add a working one with /linear add");
     let node = node(&url, KEY, json!({}));
     let e = node.open_pane("board", Value::Null).err().unwrap();
-    assert!(e.message.starts_with("which Linear team?"), "{e}");
+    assert!(e.message.starts_with("which Linear team or project?"), "{e}");
     let e = node.open_pane("board", json!({"team": "NOPE"})).err().unwrap();
     assert_eq!(e.message, "Linear has no team NOPE for this key");
+    let e = node.open_pane("board", json!({"project": "proj-9"})).err().unwrap();
+    assert_eq!(e.message, "Linear: Could not find referenced Project.");
     let none = StandIn::new(env!("CARGO_MANIFEST_DIR"))
         .binary(env!("CARGO_BIN_EXE_linear"))
         .settings(json!({"api_url": url}))
@@ -335,25 +392,29 @@ fn a_board_that_cant_open_says_why() {
 }
 
 #[test]
-fn linear_teams_lists_what_a_project_can_connect() {
+fn linear_boards_lists_what_a_project_can_connect() {
     let (url, _fake) = linear();
     let node = node(&url, KEY, json!({}));
-    let done = node.run("linear.teams", json!({})).unwrap();
+    let done = node.run("linear.boards", json!({})).unwrap();
+    // the teams, then the projects that aren't completed or canceled
     assert_eq!(
         done.result["targets"],
-        json!([{"target": {"team": "OPS"}, "name": "Operations", "key": "OPS"},
-               {"target": {"team": "ALA"}, "name": "Spark", "key": "ALA"}])
+        json!([{"target": {"team": "OPS"}, "name": "Operations", "key": "OPS", "kind": "team"},
+               {"target": {"team": "ALA"}, "name": "Spark", "key": "ALA", "kind": "team"},
+               {"target": {"project": "proj-1"}, "name": "Spark Voice", "key": "SV", "kind": "project"}])
     );
-    assert_eq!(done.result["text"], "2 Linear teams: Operations (OPS), Spark (ALA)");
+    assert_eq!(done.result["text"], "2 Linear teams: Operations (OPS), Spark (ALA). 1 Linear project: Spark Voice.");
     // a target it lists is what the board opens by
-    let target = done.result["targets"][1]["target"].clone();
-    assert_eq!(node.open_pane("board", target).unwrap().title().as_deref(), Some("Spark · Linear"));
+    let team = done.result["targets"][1]["target"].clone();
+    assert_eq!(node.open_pane("board", team).unwrap().title().as_deref(), Some("Spark · Linear"));
+    let project = done.result["targets"][2]["target"].clone();
+    assert_eq!(node.open_pane("board", project).unwrap().title().as_deref(), Some("Spark Voice · Linear"));
     let none = StandIn::new(env!("CARGO_MANIFEST_DIR"))
         .binary(env!("CARGO_BIN_EXE_linear"))
         .settings(json!({"api_url": url}))
         .start()
         .unwrap();
-    let e = none.run("linear.teams", json!({})).unwrap_err();
+    let e = none.run("linear.boards", json!({})).unwrap_err();
     assert_eq!(e.message, "no Linear API key in the vault: add one with /linear add");
 }
 
@@ -363,4 +424,31 @@ fn linear_add_posted_says_where_keys_go() {
     let node = node(&url, KEY, json!({}));
     let done = node.run("linear.add", json!({"name": "work"})).unwrap();
     assert!(done.result["text"].as_str().unwrap().contains("`/linear add`"));
+}
+
+#[test]
+fn a_projects_board_has_its_issues_from_every_team() {
+    let (url, fake) = linear();
+    fake.lock().unwrap().issues[0]["project"] = json!({"id": "proj-1"}); // ALA-1 is in Spark Voice too
+    let node = node(&url, KEY, json!({}));
+    let board = node.open_pane("board", json!({"project": "proj-1"})).unwrap();
+    let content = board.content();
+    assert_eq!(content["project"], json!({"key": "SV", "title": "Spark Voice", "leading_tool": "linear"}));
+    // ALA's states in its order, then OPS's own (Doing); a name both have is one column
+    let states: Vec<&str> = content["states"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(states, ["Todo", "In Progress", "In Review", "Done", "Canceled", "Doing"]);
+    let mut refs: Vec<&str> = content["items"].as_array().unwrap().iter().map(|i| i["ref"].as_str().unwrap()).collect();
+    refs.sort();
+    assert_eq!(refs, ["ALA-1", "OPS-6"]);
+    // a move takes the issue's own team's state by that name
+    board.input(json!({"kind": "move", "item": "lin_6", "to": "Doing"})).unwrap();
+    let update = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
+    assert_eq!(update.1, json!({"id": "lin_6", "input": {"stateId": "ops-Doing"}}));
+    assert_eq!(board.item("lin_6").unwrap()["category"], "active");
+    board.input(json!({"kind": "move", "item": "lin_6", "to": "Done"})).unwrap();
+    let update = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
+    assert_eq!(update.1["input"], json!({"stateId": "ops-Done"}));
+    let refused = board.input(json!({"kind": "move", "item": "lin_1", "to": "Doing"})).unwrap_err();
+    assert_eq!(refused.message, "Doing isn't one of ALA's states");
+    assert!(board.problems().is_empty(), "{:?}", board.problems());
 }
