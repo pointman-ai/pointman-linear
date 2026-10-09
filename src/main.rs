@@ -1,13 +1,14 @@
 //! The extension's process: the node starts it (`bin/linear`, from the extension's folder) and talks to it
 //! over stdin and stdout. The `board` pane is a Linear team's board, drawn by the apps' own board; a move,
 //! a rank or an edit goes to Linear, and every open board asks Linear what changed every minute.
+//! `linear.teams` lists the teams it can open, for the apps' Add a project board.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use linear::{board, by_id, edit_input, newest, sort_between, Linear, Team, Tracker, CONTENT_MAX};
+use linear::{board, by_id, edit_input, newest, sort_between, targets, Linear, Team, Tracker, CONTENT_MAX};
 use pointman_extension::{Extension, Handle, Job, Pane, Refused};
 use regex::Regex;
 use serde_json::{json, Value};
@@ -93,15 +94,12 @@ impl Boards {
         board(&self.map, &shown.team, shown.project.as_deref(), &shown.issues, CONTENT_MAX)
     }
 
-    /// pane.open: the team from the target, else the settings' (a board opened from the menu).
+    /// pane.open: the team (and maybe one of its projects) from the target, a connected project's.
     fn opened(&self, p: &Pane) -> anyhow::Result<Value> {
-        let settings = self.h.settings();
         let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
         let team_key = text(&p.target()["team"])
-            .or_else(|| text(&settings["team"]))
-            .context("which Linear team? Open the board with {team: \"ALA\"}, or set the extension's team")?;
-        let project = text(&p.target()["project"])
-            .or_else(|| text(&settings["project"]).filter(|_| p.target()["team"].is_null()));
+            .context("which Linear team? Open the board with {team: \"ALA\"}: /linear teams lists them")?;
+        let project = text(&p.target()["project"]);
         let linear = self.linear()?;
         let team = linear.team(&team_key)?;
         let issues = by_id(linear.issues(&team.key, project.as_deref(), None)?);
@@ -226,6 +224,22 @@ fn main() -> anyhow::Result<()> {
     ext.command("linear.add", |_: &Job| {
         Ok(json!({"text": "A Linear API key is added in the Pointman app, so it never goes in a post: \
                            type `/linear add` there and paste it."}))
+    });
+
+    // what a project can be connected to (Pointman's Project pane, MB-378; the board's `targets`): the
+    // teams the key sees, each as the target the board opens by
+    let b = boards.clone();
+    ext.command("linear.teams", move |_: &Job| {
+        let teams = targets(&b.linear()?.teams()?);
+        let names: Vec<String> = teams
+            .iter()
+            .map(|t| format!("{} ({})", t["name"].as_str().unwrap_or_default(), t["key"].as_str().unwrap_or_default()))
+            .collect();
+        let text = match names.len() {
+            0 => "This Linear key sees no teams.".to_string(),
+            n => format!("{n} Linear team{}: {}", if n == 1 { "" } else { "s" }, names.join(", ")),
+        };
+        Ok(json!({"targets": teams, "text": text}))
     });
 
     let b = boards.clone();

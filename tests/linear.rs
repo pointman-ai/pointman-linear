@@ -1,6 +1,6 @@
 //! The extension against a stand-in node (pointman-extension's testing::StandIn), started as a node starts
 //! it, with a stand-in Linear: a GraphQL server on a free local port that answers as Linear's API would,
-//! for one team (ALA), and keeps the changes it's asked to make.
+//! for one team's board (ALA, among two teams), and keeps the changes it's asked to make.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -54,6 +54,11 @@ impl Fake {
         let word = query.split(|c: char| !c.is_alphanumeric()).find(|w| ["teams", "issues", "issueUpdate"].contains(w));
         self.calls.push((word.unwrap_or("?").to_string(), vars.clone()));
         match word {
+            Some("teams") if vars["key"].is_null() => (
+                200,
+                json!({"data": {"teams": {"nodes": [{"id": "team-1", "key": "ALA", "name": "Spark"},
+                                                    {"id": "team-2", "key": "OPS", "name": "Operations"}]}}}),
+            ),
             Some("teams") => {
                 if vars["key"] != "ALA" {
                     return (200, json!({"data": {"teams": {"nodes": []}}}));
@@ -230,8 +235,8 @@ fn a_teams_board_opens_with_its_states_and_issues() {
 #[test]
 fn moves_ranks_and_edits_go_to_linear() {
     let (url, fake) = linear();
-    let node = node(&url, KEY, json!({"team": "ALA"}));
-    let board = node.open_pane("board", Value::Null).unwrap(); // the settings' team: opened from the menu
+    let node = node(&url, KEY, json!({}));
+    let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
     board.input(json!({"kind": "move", "item": "lin_1", "to": "In Review"})).unwrap();
     assert_eq!(board.item("lin_1").unwrap()["category"], "review");
     let update = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
@@ -326,6 +331,29 @@ fn a_board_that_cant_open_says_why() {
         .start()
         .unwrap();
     let e = none.open_pane("board", json!({"team": "ALA"})).err().unwrap();
+    assert_eq!(e.message, "no Linear API key in the vault: add one with /linear add");
+}
+
+#[test]
+fn linear_teams_lists_what_a_project_can_connect() {
+    let (url, _fake) = linear();
+    let node = node(&url, KEY, json!({}));
+    let done = node.run("linear.teams", json!({})).unwrap();
+    assert_eq!(
+        done.result["targets"],
+        json!([{"target": {"team": "OPS"}, "name": "Operations", "key": "OPS"},
+               {"target": {"team": "ALA"}, "name": "Spark", "key": "ALA"}])
+    );
+    assert_eq!(done.result["text"], "2 Linear teams: Operations (OPS), Spark (ALA)");
+    // a target it lists is what the board opens by
+    let target = done.result["targets"][1]["target"].clone();
+    assert_eq!(node.open_pane("board", target).unwrap().title().as_deref(), Some("Spark · Linear"));
+    let none = StandIn::new(env!("CARGO_MANIFEST_DIR"))
+        .binary(env!("CARGO_BIN_EXE_linear"))
+        .settings(json!({"api_url": url}))
+        .start()
+        .unwrap();
+    let e = none.run("linear.teams", json!({})).unwrap_err();
     assert_eq!(e.message, "no Linear API key in the vault: add one with /linear add");
 }
 

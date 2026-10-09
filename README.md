@@ -15,7 +15,8 @@ pointman add linear
 ## The board pane
 
 `[[panes]] id = "board"`, `format = "board"`. Opened with `{team: "ALA"}` and optionally
-`project: "Spark"`, or from the apps' menu with no target, which uses the settings' `team` and `project`.
+`project: "Spark"` (a Linear project's issues only): a project connected in Pointman's Project pane
+keeps that target, and opens the board by it.
 
 - **Columns:** the team's workflow states in Linear's order, each with its category. For example, In
   Review is `review`, and a started state named for a hold is `active`.
@@ -34,7 +35,18 @@ pointman add linear
   last look, and all of it every ten minutes. Only the change goes to the apps, through the SDK's
   `show_board`.
 
-Settings: `team`, `project`, `refresh_seconds` (60), and `api_url` (Linear's GraphQL endpoint).
+## Teams
+
+`linear.teams` (`/linear teams`) lists the teams the key sees, by name. It's the board's `targets`, so the
+apps' **Add a project board** runs it to offer what can be connected:
+
+```
+{targets: [{target: {team: "ALA"}, name: "Spark", key: "ALA"}], text: "1 Linear team: Spark (ALA)"}
+```
+
+`key` is the project key it suggests: the team's own.
+
+Settings: `refresh_seconds` (60), and `api_url` (Linear's GraphQL endpoint).
 
 ## Building
 

@@ -213,6 +213,14 @@ impl Linear {
         })
     }
 
+    /// Every team the key sees, by name: what a project can be connected to.
+    pub fn teams(&self) -> anyhow::Result<Vec<Value>> {
+        let data = self.gql("query { teams(first: 250) { nodes { id key name } } }", json!({}))?;
+        let mut teams = data["teams"]["nodes"].as_array().cloned().unwrap_or_default();
+        teams.sort_by(|a, b| a["name"].as_str().unwrap_or_default().cmp(b["name"].as_str().unwrap_or_default()));
+        Ok(teams)
+    }
+
     /// The team's issues for its board: open ones, and those closed in the last 14 days. With `since`,
     /// only those updated after it, closed or not (what changed since the last look).
     pub fn issues(&self, team: &str, project: Option<&str>, since: Option<&str>) -> anyhow::Result<Vec<Value>> {
@@ -345,6 +353,18 @@ pub fn board(map: &Tracker, team: &Team, project: Option<&str>, issues: &HashMap
     }
     out["items"] = Value::Array(kept);
     out
+}
+
+/// What the board opens by, for the apps' Add a project board (Pointman's MB-376–378): each team as
+/// `{target: {team}, name, key}`, `key` the project key it suggests (the team's own).
+pub fn targets(teams: &[Value]) -> Vec<Value> {
+    teams
+        .iter()
+        .filter_map(|t| {
+            let key = t["key"].as_str()?;
+            Some(json!({"target": {"team": key}, "name": t["name"].as_str().unwrap_or(key), "key": key}))
+        })
+        .collect()
 }
 
 /// Where an issue goes between its neighbours in its column: the sortOrder that puts it just before or

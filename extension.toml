@@ -5,7 +5,7 @@
 [extension]
 id = "linear"
 name = "Linear"
-version = "0.1.0"
+version = "0.2.0"
 publisher = "aurelio"
 summary = "A Linear team's board in the apps, drawn by Pointman's own board: moves, ranks and edits go to Linear."
 node = ">=0.1,<1"
@@ -32,16 +32,6 @@ needed = 1
 [settings]
 type = "object"
 
-[settings.properties.team]
-type = "string"
-default = ""
-description = "The team whose board opens from the menu, by its key (ALA)"
-
-[settings.properties.project]
-type = "string"
-default = ""
-description = "Only this Linear project's issues, by its name; empty for the whole team"
-
 [settings.properties.refresh_seconds]
 type = "integer"
 default = 60
@@ -60,10 +50,20 @@ slash = "add"
 form = "account"
 summary = "Add a Linear API key for every node"
 
-# a team's board (Pointman's docs/dev/panes.md, "Boards"): opened with {team, project?}, or from the apps'
-# menu with the settings' team
+# what a project can be connected to (Pointman's Project pane): the teams the key sees, each as the
+# target the board opens by, {targets: [{target: {team}, name, key}], text}
+[[commands]]
+kind = "linear.teams"
+title = "List Linear teams"
+params = { type = "object", properties = {} }
+slash = "teams"
+summary = "The Linear teams a project can be connected to"
+
+# a team's board (Pointman's docs/dev/panes.md, "Boards"): opened with {team, project?}, a connected
+# project's target, from those linear.teams lists
 [[panes]]
 id = "board"
 title = "Linear"
 format = "board"
-opens = ["menu", "command"]
+opens = ["command"]
+targets = "linear.teams"
