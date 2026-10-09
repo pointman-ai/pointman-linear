@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
-use linear::{board, by_id, issue_input, newest, sort_between, targets, Linear, Scope, Tracker, CONTENT_MAX};
+use linear::{
+    board, by_id, issue_input, newest, project_filter, sort_between, targets, team_filter, Linear, Scope, Tracker,
+    CONTENT_MAX,
+};
 use pointman_extension::{Extension, Handle, Job, Pane, Refused};
 use regex::Regex;
 use serde_json::{json, Value};
@@ -116,16 +119,29 @@ impl Boards {
     /// {project: id}.
     fn opened(&self, p: &Pane) -> anyhow::Result<Value> {
         let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let started = Instant::now();
         let linear = self.linear()?;
-        let scope = match (text(&p.target()["team"]), text(&p.target()["project"])) {
-            (Some(team), None) => linear.team(&team)?,
-            (None, Some(project)) => linear.project(&project)?,
+        let (team, project) = (text(&p.target()["team"]), text(&p.target()["project"]));
+        let filter = match (&team, &project) {
+            (Some(team), None) => team_filter(team),
+            (None, Some(project)) => project_filter(project),
             _ => bail!(
                 "which Linear team or project? Open the board with {{team: \"ALA\"}} or {{project: id}}: \
                         /linear boards lists them"
             ),
         };
-        let issues = by_id(linear.issues(&scope.filter, None)?);
+        // the team or project and its issues at once: the issues need only the target's filter
+        let (scope, issues) = std::thread::scope(|s| {
+            let scope = s.spawn(|| match (&team, &project) {
+                (Some(team), _) => linear.team(team),
+                (_, Some(project)) => linear.project(project),
+                _ => unreachable!("the target was checked above"),
+            });
+            let issues = s.spawn(|| linear.issues(&filter, None));
+            (joined(scope), joined(issues))
+        });
+        let (scope, issues) = (scope?, by_id(issues?));
+        self.h.log(format!("board {}: {} issues in {} ms", scope.name, issues.len(), started.elapsed().as_millis()));
         let title = format!("{} · Linear", scope.name);
         let shown = Shown {
             scope,
@@ -344,6 +360,11 @@ impl Boards {
             p.show_board(self.content(shown));
         }
     }
+}
+
+/// A call's answer from its thread (one that panicked, as an error).
+fn joined<T>(h: std::thread::ScopedJoinHandle<'_, anyhow::Result<T>>) -> anyhow::Result<T> {
+    h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("a call to Linear failed unexpectedly")))
 }
 
 fn main() -> anyhow::Result<()> {

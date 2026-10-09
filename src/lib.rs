@@ -264,7 +264,7 @@ impl Linear {
             key: team.key.clone(),
             name: team.name.clone(),
             project: None,
-            filter: json!({"team": {"key": {"eq": team.key}}}),
+            filter: team_filter(&team.key),
             teams: vec![team],
             labels: nodes(&data["issueLabels"]),
         })
@@ -286,7 +286,7 @@ impl Linear {
             key: key_for(name).unwrap_or_else(|| teams.first().map(|t| t.key.clone()).unwrap_or_default()),
             name: name.to_string(),
             project: p["id"].as_str().map(String::from),
-            filter: json!({"project": {"id": {"eq": p["id"]}}}),
+            filter: project_filter(p["id"].as_str().unwrap_or(id)),
             teams,
             labels: nodes(&data["issueLabels"]),
         })
@@ -546,6 +546,16 @@ pub fn targets(teams: &[Value], projects: &[Value]) -> Vec<Value> {
         Some(json!({"target": {"project": id}, "name": name, "key": key_for(name), "kind": "project"}))
     });
     teams.chain(projects).collect()
+}
+
+/// A team's issues, as Linear's IssueFilter: what its board shows.
+pub fn team_filter(key: &str) -> Value {
+    json!({"team": {"key": {"eq": key}}})
+}
+
+/// A Linear project's issues, as Linear's IssueFilter.
+pub fn project_filter(id: &str) -> Value {
+    json!({"project": {"id": {"eq": id}}})
 }
 
 /// A project key from a name, as the apps suggest one (2–10 capitals and digits, a letter first): its
