@@ -5,6 +5,7 @@
 //! `linear.boards` lists the teams and projects it can open, for the apps' Add a project board.
 
 use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -17,7 +18,10 @@ use pointman_extension::{Extension, Handle, Job, Pane, Refused};
 use regex::Regex;
 use serde_json::{json, Value};
 
-/// How often the vault's linear.* names are looked at, and how long an opened key is kept.
+/// How often the vault's linear.* names are looked at, and how long an opened key is kept. A list older
+/// than LIST_EVERY is still used while it's asked for again behind (each ask is a round trip to core, 0.2 s
+/// from the Mac, that a board's open waited on: Pointman thread 6216); one older than OPEN_EVERY, or one
+/// with no key in it, is asked for first.
 const LIST_EVERY: Duration = Duration::from_secs(60);
 const OPEN_EVERY: Duration = Duration::from_secs(1800);
 /// How often a board asks Linear for all of it again, not just what changed: issues that left the team
@@ -31,21 +35,67 @@ const DETAILS_KEPT: usize = 20;
 struct Vault {
     listed: Option<Instant>,
     names: Vec<String>,
+    /// The list being asked for behind, None in it if the node couldn't say.
+    asking: Option<Receiver<Option<Vec<String>>>>,
     opened: Option<(Instant, String, Option<String>)>,
+}
+
+/// What's done about the vault's list, from its age, whether it's being asked for already and whether it
+/// has a key in it.
+#[derive(Debug, PartialEq)]
+enum Relist {
+    Now,
+    Behind,
+    Kept,
+}
+
+fn relist(age: Option<Duration>, asking: bool, empty: bool) -> Relist {
+    match age {
+        None => Relist::Now,
+        Some(age) if age > OPEN_EVERY || (empty && age > LIST_EVERY) => Relist::Now,
+        Some(age) if age > LIST_EVERY && !asking => Relist::Behind,
+        Some(_) => Relist::Kept,
+    }
+}
+
+fn list(h: &Handle) -> Option<Vec<String>> {
+    let got = h.request("secret.list", json!({"prefix": "linear."})).ok()?;
+    let mut names: Vec<String> = got["names"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
+        .unwrap_or_default();
+    names.sort();
+    Some(names)
 }
 
 impl Vault {
     fn key(&mut self, h: &Handle) -> Option<String> {
-        if self.listed.is_none_or(|t| t.elapsed() > LIST_EVERY) {
-            self.listed = Some(Instant::now());
-            if let Ok(got) = h.request("secret.list", json!({"prefix": "linear."})) {
-                let mut names: Vec<String> = got["names"]
-                    .as_array()
-                    .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                    .unwrap_or_default();
-                names.sort();
-                self.names = names;
+        if let Some(asking) = &self.asking {
+            match asking.try_recv() {
+                Ok(got) => {
+                    self.names = got.unwrap_or_else(|| self.names.clone());
+                    self.asking = None;
+                }
+                Err(TryRecvError::Disconnected) => self.asking = None,
+                Err(TryRecvError::Empty) => {}
             }
+        }
+        match relist(self.listed.map(|t| t.elapsed()), self.asking.is_some(), self.names.is_empty()) {
+            Relist::Now => {
+                self.listed = Some(Instant::now());
+                self.asking = None;
+                if let Some(names) = list(h) {
+                    self.names = names;
+                }
+            }
+            Relist::Behind => {
+                self.listed = Some(Instant::now());
+                let (tx, rx) = mpsc::channel();
+                self.asking = Some(rx);
+                let h = h.clone();
+                std::thread::spawn(move || tx.send(list(&h)));
+            }
+            Relist::Kept => {}
         }
         let name = self.names.first()?.clone();
         if let Some((at, n, key)) = &self.opened {
@@ -412,4 +462,21 @@ fn main() -> anyhow::Result<()> {
     ext.every(Duration::from_secs(1), move |_: &Handle| b.refresh(), "boards");
 
     ext.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_vaults_list_is_asked_for_first_then_behind_and_first_again_when_too_old_or_keyless() {
+        let secs = |s: u64| Some(Duration::from_secs(s));
+        assert_eq!(relist(None, false, true), Relist::Now);
+        assert_eq!(relist(secs(10), false, false), Relist::Kept);
+        assert_eq!(relist(secs(61), false, false), Relist::Behind);
+        assert_eq!(relist(secs(61), true, false), Relist::Kept, "asked for once");
+        assert_eq!(relist(secs(61), false, true), Relist::Now, "a key added since is found at once");
+        assert_eq!(relist(secs(10), false, true), Relist::Kept);
+        assert_eq!(relist(secs(1801), true, false), Relist::Now);
+    }
 }
