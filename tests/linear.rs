@@ -14,9 +14,12 @@ use serde_json::{json, Value};
 const KEY: &str = "lin_api_0123456789abcdefghijklmnopqrstuvwxyzABCD";
 const WAIT: Duration = Duration::from_secs(10);
 
-/// Linear, as far as the board needs it: the team, its issues, and issueUpdate.
+/// Linear, as far as the board needs it: the teams (people, labels), issues, issueUpdate, issueCreate
+/// and comments.
 struct Fake {
     issues: Vec<Value>,
+    /// (issue id, body, author's display name), oldest first
+    comments: Vec<(String, String, String)>,
     /// (query's first word, variables) for each call
     calls: Vec<(String, Value)>,
     /// issueUpdate refuses these ids with this message
@@ -48,10 +51,29 @@ fn ops_states() -> Vec<Value> {
         .collect()
 }
 
+fn person(id: &str, name: &str, handle: &str) -> Value {
+    json!({"id": id, "name": name, "displayName": handle, "avatarUrl": format!("https://public.linear.app/{handle}.png"),
+           "active": true})
+}
+
+fn people() -> Vec<Value> {
+    vec![person("u1", "James Briggs", "james"), person("u2", "Ada Lovelace", "ada")]
+}
+
+fn label(id: &str, name: &str) -> Value {
+    json!({"id": id, "name": name, "color": "#eb5757", "isGroup": false})
+}
+
+/// The workspace's own labels, beside each team's.
+fn workspace_labels() -> Value {
+    json!({"nodes": [label("l-feat", "Feature")]})
+}
+
 fn team(id: &str, key: &str, name: &str, states: Vec<Value>) -> Value {
     json!({"id": id, "key": key, "name": name, "states": {"nodes": states},
            "cycles": {"nodes": [{"id": "cy-41", "number": 41, "name": null, "startsAt": "2026-10-05T00:00:00.000Z",
-                                 "endsAt": "2026-10-19T00:00:00.000Z"}]}})
+                                 "endsAt": "2026-10-19T00:00:00.000Z"}]},
+           "members": {"nodes": people()}, "labels": {"nodes": [label(&format!("l-bug-{key}"), "Bug")]}})
 }
 
 fn teams() -> Vec<Value> {
@@ -64,7 +86,8 @@ fn issue(n: u32, state_name: &str, order: f64) -> Value {
            "dueDate": null, "url": format!("https://linear.app/alai/issue/ALA-{n}"),
            "updatedAt": format!("2026-10-08T10:00:{n:02}.000Z"), "sortOrder": order,
            "team": {"id": "team-1"}, "state": {"id": st["id"], "name": st["name"], "type": st["type"]},
-           "assignee": {"name": "James Briggs", "displayName": "james"}, "labels": {"nodes": []},
+           "assignee": {"id": "u1", "name": "James Briggs", "displayName": "james"}, "labels": {"nodes": []},
+           "estimate": null, "createdAt": "2026-10-01T00:00:00.000Z", "description": format!("Steps for {n}"),
            "parent": null, "cycle": null, "projectMilestone": null, "project": null})
 }
 
@@ -83,9 +106,10 @@ impl Fake {
     fn answer(&mut self, body: &Value) -> (u16, Value) {
         let query = body["query"].as_str().unwrap_or_default();
         let vars = &body["variables"];
-        let word = query
-            .split(|c: char| !c.is_alphanumeric())
-            .find(|w| ["teams", "projects", "project", "issues", "issueUpdate"].contains(w));
+        let word = query.split(|c: char| !c.is_alphanumeric()).find(|w| {
+            ["teams", "projects", "project", "issues", "issue", "issueUpdate", "issueCreate", "commentCreate"]
+                .contains(w)
+        });
         self.calls.push((word.unwrap_or("?").to_string(), vars.clone()));
         match word {
             Some("teams") if vars["key"].is_null() => (
@@ -95,7 +119,7 @@ impl Fake {
             ),
             Some("teams") => {
                 let found: Vec<Value> = teams().into_iter().filter(|t| t["key"] == vars["key"]).collect();
-                (200, json!({"data": {"teams": {"nodes": found}}}))
+                (200, json!({"data": {"teams": {"nodes": found}, "issueLabels": workspace_labels()}}))
             }
             Some("projects") => {
                 // the status filter is in the query's text: completed and canceled ones aren't listed
@@ -112,7 +136,8 @@ impl Fake {
             }
             Some("project") if vars["id"] == "proj-1" => (
                 200,
-                json!({"data": {"project": {"id": "proj-1", "name": "Spark Voice", "teams": {"nodes": teams()}}}}),
+                json!({"data": {"project": {"id": "proj-1", "name": "Spark Voice", "teams": {"nodes": teams()}},
+                                "issueLabels": workspace_labels()}}),
             ),
             Some("project") => (
                 200,
@@ -151,26 +176,119 @@ impl Fake {
                 }
                 self.clock += 1;
                 let clock = self.clock;
-                let Some(it) = self.issues.iter_mut().find(|i| i["id"] == id.as_str()) else {
+                if !self.issues.iter().any(|i| i["id"] == id.as_str()) {
                     return (200, json!({"errors": [{"message": "Entity not found"}]}));
-                };
-                let input = &vars["input"];
-                if let Some(st) = input["stateId"].as_str() {
-                    let s = states().into_iter().chain(ops_states()).find(|s| s["id"] == st).unwrap();
-                    it["state"] = json!({"id": s["id"], "name": s["name"], "type": s["type"]});
                 }
-                for (from, to) in
-                    [("title", "title"), ("priority", "priority"), ("dueDate", "dueDate"), ("sortOrder", "sortOrder")]
-                {
-                    if let Some(v) = input.get(from) {
-                        it[to] = v.clone();
-                    }
+                let input = &vars["input"];
+                let parent = input["parentId"].as_str().map(|p| {
+                    let found = self.issues.iter().find(|i| i["id"] == p).unwrap();
+                    json!({"id": found["id"], "identifier": found["identifier"]})
+                });
+                let it = self.issues.iter_mut().find(|i| i["id"] == id.as_str()).unwrap();
+                apply(it, input);
+                if let Some(parent) = parent {
+                    it["parent"] = parent;
                 }
                 it["updatedAt"] = json!(format!("2026-10-08T11:00:{clock:02}.000Z"));
                 (200, json!({"data": {"issueUpdate": {"success": true, "issue": it.clone()}}}))
             }
+            Some("issueCreate") => {
+                self.clock += 1;
+                let input = &vars["input"];
+                let n = 100 + self.clock;
+                let mut it = issue(n, "Todo", 0.0);
+                if input["teamId"] == "team-2" {
+                    it["team"] = json!({"id": "team-2"});
+                    it["identifier"] = json!(format!("OPS-{n}"));
+                    it["state"] = json!({"id": "ops-Todo", "name": "Todo", "type": "unstarted"});
+                }
+                if let Some(project) = input["projectId"].as_str() {
+                    it["project"] = json!({"id": project});
+                }
+                it["assignee"] = Value::Null;
+                apply(&mut it, input);
+                it["updatedAt"] = json!(format!("2026-10-08T11:00:{:02}.000Z", self.clock));
+                self.issues.push(it.clone());
+                (200, json!({"data": {"issueCreate": {"success": true, "issue": it}}}))
+            }
+            Some("commentCreate") => {
+                let input = &vars["input"];
+                let (on, body) = (input["issueId"].as_str().unwrap(), input["body"].as_str().unwrap());
+                self.comments.push((on.into(), body.into(), "james".into()));
+                (200, json!({"data": {"commentCreate": {"success": true}}}))
+            }
+            Some("issue") => {
+                let id = vars["id"].as_str().unwrap_or_default();
+                let Some(it) = self.issues.iter().find(|i| i["id"] == id) else {
+                    return (200, json!({"errors": [{"message": "Entity not found: Issue"}]}));
+                };
+                let children: Vec<Value> = self
+                    .issues
+                    .iter()
+                    .filter(|i| i["parent"]["id"] == id)
+                    .map(|i| json!({"identifier": i["identifier"]}))
+                    .collect();
+                let comments: Vec<Value> = self
+                    .comments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.0 == id)
+                    .map(|(n, c)| {
+                        json!({"body": c.1, "createdAt": format!("2026-10-09T01:00:{n:02}.000Z"),
+                               "user": {"name": "James Briggs", "displayName": c.2}})
+                    })
+                    .collect();
+                (
+                    200,
+                    json!({"data": {"issue": {"id": id, "description": it["description"],
+                                              "children": {"nodes": children}, "comments": {"nodes": comments}}}}),
+                )
+            }
             _ => (200, json!({"errors": [{"message": format!("unknown query {query}")}]})),
         }
+    }
+}
+
+/// An issue input's fields onto the stand-in's issue, as Linear would keep them.
+fn apply(it: &mut Value, input: &Value) {
+    if let Some(st) = input["stateId"].as_str() {
+        let s = states().into_iter().chain(ops_states()).find(|s| s["id"] == st).unwrap();
+        it["state"] = json!({"id": s["id"], "name": s["name"], "type": s["type"]});
+    }
+    for (from, to) in [
+        ("title", "title"),
+        ("priority", "priority"),
+        ("dueDate", "dueDate"),
+        ("sortOrder", "sortOrder"),
+        ("estimate", "estimate"),
+        ("description", "description"),
+    ] {
+        if let Some(v) = input.get(from) {
+            it[to] = v.clone();
+        }
+    }
+    if let Some(who) = input.get("assigneeId") {
+        it["assignee"] = people().into_iter().find(|p| p["id"] == *who).unwrap_or(Value::Null);
+    }
+    if let Some(ids) = input["labelIds"].as_array() {
+        let all = [label("l-bug-ALA", "Bug"), label("l-bug-OPS", "Bug"), label("l-feat", "Feature")];
+        let nodes: Vec<Value> = ids
+            .iter()
+            .filter_map(|id| all.iter().find(|l| l["id"] == *id))
+            .map(|l| json!({"id": l["id"], "name": l["name"]}))
+            .collect();
+        it["labels"] = json!({"nodes": nodes});
+    }
+    if let Some(cycle) = input.get("cycleId") {
+        it["cycle"] = if cycle.is_null() {
+            Value::Null
+        } else {
+            json!({"id": cycle, "number": 41, "name": null, "startsAt": "2026-10-05T00:00:00.000Z",
+                   "endsAt": "2026-10-19T00:00:00.000Z"})
+        };
+    }
+    if input.get("parentId").is_some_and(Value::is_null) {
+        it["parent"] = Value::Null;
     }
 }
 
@@ -184,6 +302,7 @@ fn linear() -> (String, Arc<Mutex<Fake>>) {
             issue(4, "Done", 1.0),
             ops_issue(6, "Todo"),
         ],
+        comments: vec![],
         calls: vec![],
         refuse: None,
         clock: 0,
@@ -300,7 +419,7 @@ fn moves_ranks_and_edits_go_to_linear() {
     let (method, last) = board.frames().pop().unwrap();
     assert_eq!(method, "pane.patch");
     let paths: Vec<&str> = last["patch"].as_array().unwrap().iter().map(|o| o["path"].as_str().unwrap()).collect();
-    assert_eq!(paths, ["/i/lin_1/category", "/i/lin_1/state"]);
+    assert_eq!(paths, ["/i/lin_1/category", "/i/lin_1/state", "/i/lin_1/updated_at"]);
 
     // just before ALA-3 in In Review (sortOrder 1): between nothing and 1
     board.input(json!({"kind": "rank", "item": "lin_1", "before": "lin_3"})).unwrap();
@@ -331,7 +450,7 @@ fn what_linear_refuses_snaps_back_with_its_reason() {
     let no_state = board.input(json!({"kind": "move", "item": "lin_1", "to": "Shipped"})).unwrap_err();
     assert_eq!(no_state.message, "Shipped isn't one of ALA's states");
     let owner = board.input(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": "loupe"}})).unwrap_err();
-    assert!(owner.message.starts_with("owner is changed in Linear itself"), "{owner}");
+    assert_eq!(owner.message, "loupe isn't one of ALA's people");
     let gone = board.input(json!({"kind": "move", "item": "lin_99", "to": "Done"})).unwrap_err();
     assert_eq!(gone.message, "lin_99 isn't on this board");
     assert!(board.frames().is_empty(), "{:?}", board.frames());
@@ -451,4 +570,104 @@ fn a_projects_board_has_its_issues_from_every_team() {
     let refused = board.input(json!({"kind": "move", "item": "lin_1", "to": "Doing"})).unwrap_err();
     assert_eq!(refused.message, "Doing isn't one of ALA's states");
     assert!(board.problems().is_empty(), "{:?}", board.problems());
+}
+
+#[test]
+fn an_opened_card_gets_its_detail() {
+    let (url, fake) = linear();
+    fake.lock().unwrap().issues[1]["parent"] = json!({"id": "lin_1", "identifier": "ALA-1"});
+    fake.lock().unwrap().comments.push(("lin_1".into(), "First!".into(), "ada".into()));
+    let node = node(&url, KEY, json!({}));
+    let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
+    assert!(board.item("lin_1").unwrap().get("body").is_none());
+    board.input(json!({"kind": "open", "item": "lin_1"})).unwrap();
+    let card = board.item("lin_1").unwrap();
+    assert_eq!(card["body"], "Steps for 1");
+    assert_eq!(card["children"], json!(["ALA-2"]));
+    assert_eq!(card["comments"], json!([{"author": "ada", "body": "First!", "at": "2026-10-09T01:00:00.000Z"}]));
+    // only the detail went out
+    let (method, last) = board.frames().pop().unwrap();
+    assert_eq!(method, "pane.patch");
+    let mut paths: Vec<&str> = last["patch"].as_array().unwrap().iter().map(|o| o["path"].as_str().unwrap()).collect();
+    paths.sort();
+    assert_eq!(paths, ["/i/lin_1/body", "/i/lin_1/children", "/i/lin_1/comments"]);
+    // the board's people and labels, for the card's pickers
+    let groups = &board.content()["groups"];
+    let handles: Vec<&str> =
+        groups["people"].as_array().unwrap().iter().map(|p| p["handle"].as_str().unwrap()).collect();
+    assert_eq!(handles, ["ada", "james"]);
+    assert_eq!(groups["people"][1]["avatar"], "https://public.linear.app/james.png");
+    let labels: Vec<&str> = groups["labels"].as_array().unwrap().iter().map(|l| l["name"].as_str().unwrap()).collect();
+    assert_eq!(labels, ["Bug", "Feature"]);
+    assert!(board.problems().is_empty(), "{:?}", board.problems());
+}
+
+#[test]
+fn every_field_of_a_card_goes_to_linear() {
+    let (url, fake) = linear();
+    let node = node(&url, KEY, json!({}));
+    let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
+    board.input(json!({"kind": "open", "item": "lin_1"})).unwrap();
+    board
+        .input(json!({"kind": "edit", "item": "lin_1", "fields": {
+            "owner": "ada", "labels": ["Bug", "Feature"], "estimate": 3, "sprint": "Cycle 41", "parent": "ALA-3",
+            "body": "Now with steps", "target": "2026-10-20", "priority": "urgent"}}))
+        .unwrap();
+    let update = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
+    assert_eq!(
+        update.1["input"],
+        json!({"assigneeId": "u2", "labelIds": ["l-bug-ALA", "l-feat"], "estimate": 3, "cycleId": "cy-41",
+               "parentId": "lin_3", "description": "Now with steps", "dueDate": "2026-10-20", "priority": 1})
+    );
+    let card = board.item("lin_1").unwrap();
+    assert_eq!((card["owner"].as_str(), &card["labels"]), (Some("ada"), &json!(["Bug", "Feature"])));
+    assert_eq!(
+        (&card["estimate"], card["sprint"].as_str(), card["parent"].as_str()),
+        (&json!(3), Some("Cycle 41"), Some("ALA-3"))
+    );
+    assert_eq!((card["body"].as_str(), card["priority"].as_str()), (Some("Now with steps"), Some("urgent")));
+    // taken off again
+    board
+        .input(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": null, "sprint": null, "parent": null}}))
+        .unwrap();
+    let card = board.item("lin_1").unwrap();
+    assert_eq!((&card["owner"], &card["sprint"], &card["parent"]), (&Value::Null, &Value::Null, &Value::Null));
+    let nobody = board.input(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": "nobody"}})).unwrap_err();
+    assert_eq!(nobody.message, "nobody isn't one of ALA's people");
+    assert!(board.problems().is_empty(), "{:?}", board.problems());
+}
+
+#[test]
+fn a_new_card_and_a_comment_go_to_linear() {
+    let (url, fake) = linear();
+    let node = node(&url, KEY, json!({}));
+    let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
+    board.input(json!({"kind": "create", "fields": {"title": "Fresh", "state": "In Review", "owner": "ada"}})).unwrap();
+    let made = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueCreate").cloned().unwrap();
+    assert_eq!(
+        made.1["input"],
+        json!({"title": "Fresh", "stateId": "st-In Review", "assigneeId": "u2", "teamId": "team-1"})
+    );
+    let card = board.item("lin_101").unwrap();
+    assert_eq!(
+        (card["ref"].as_str(), card["state"].as_str(), card["owner"].as_str()),
+        (Some("ALA-101"), Some("In Review"), Some("ada"))
+    );
+    let untitled = board.input(json!({"kind": "create", "fields": {"state": "Todo"}})).unwrap_err();
+    assert_eq!(untitled.message, "a new card needs a title");
+
+    board.input(json!({"kind": "comment", "item": "lin_2", "body": "Looks good"})).unwrap();
+    let said = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "commentCreate").cloned().unwrap();
+    assert_eq!(said.1["input"], json!({"issueId": "lin_2", "body": "Looks good"}));
+    assert_eq!(board.item("lin_2").unwrap()["comments"][0]["body"], "Looks good");
+    let empty = board.input(json!({"kind": "comment", "item": "lin_2", "body": " "})).unwrap_err();
+    assert_eq!(empty.message, "a comment needs words");
+
+    // on a project's board, a new card goes in the project, on the team it names
+    let project = node.open_pane("board", json!({"project": "proj-1"})).unwrap();
+    project.input(json!({"kind": "create", "fields": {"title": "Ops work", "team": "OPS"}})).unwrap();
+    let made = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueCreate").cloned().unwrap();
+    assert_eq!(made.1["input"], json!({"title": "Ops work", "teamId": "team-2", "projectId": "proj-1"}));
+    assert_eq!(project.item("lin_102").unwrap()["ref"], "OPS-102");
+    assert!(board.problems().is_empty() && project.problems().is_empty());
 }

@@ -9,9 +9,14 @@
 //! {project: {key, title, leading_tool: "linear", note?},
 //!  states: [{name, category}],                       // the teams', in Linear's order
 //!  items: [{id, ref, level, kind, title, state, category, owner, parent, sprint, target, priority,
-//!           rank, url}],                             // open issues, and those closed in the last 14 days
-//!  groups: {sprints: [{id, name, start, end}], milestones: [{id, name, target}]}}
+//!           rank, url, labels, estimate, created_at, updated_at,
+//!           body?, comments?, children?}],           // open issues, and those closed in the last 14 days;
+//!                                                    // body, comments and children once it's opened
+//!  groups: {sprints: [{id, name, start, end}], milestones: [{id, name, target}],
+//!           people: [{handle, name, avatar}], labels: [{name, color}]}}
 //! ```
+//!
+//! An item's `owner` is one of `people`'s handles (Linear's display name).
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -28,9 +33,17 @@ const PAGES: usize = 10;
 const CLOSED_DAYS: u32 = 14;
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub const ISSUE_FIELDS: &str = "id identifier title priority dueDate url updatedAt sortOrder \
-    team { id } state { id name type } assignee { name displayName } labels { nodes { name } } parent { identifier } \
-    cycle { id number name startsAt endsAt } projectMilestone { id name targetDate }";
+pub const ISSUE_FIELDS: &str = "id identifier title priority estimate dueDate url createdAt updatedAt sortOrder \
+    team { id } state { id name type } assignee { id name displayName } labels(first: 10) { nodes { id name } } \
+    parent { id identifier } cycle { id number name startsAt endsAt } projectMilestone { id name targetDate }";
+
+/// An opened card's detail: its description, comments and sub-issues.
+const DETAIL_FIELDS: &str = "id description children(first: 100) { nodes { identifier } } \
+    comments(first: 100) { nodes { body createdAt user { name displayName } } }";
+
+/// The people and labels a board offers, beside its teams': the workspace's own labels.
+const WORKSPACE_LABELS: &str =
+    "issueLabels(first: 250, filter: {team: {null: true}}) { nodes { id name color isGroup } }";
 
 /// Linear's 0–4, as the projects syntax says them (tracker.toml's [priority]; Linear calls 3 "Medium").
 pub fn priority_of(n: i64) -> Option<&'static str> {
@@ -145,15 +158,21 @@ pub struct Scope {
     /// The board's project key: the team's, or one from the project's name.
     pub key: String,
     pub name: String,
+    /// The Linear project's id, for a project's board: a new issue goes in it.
+    pub project: Option<String>,
     /// Its issues, as Linear's IssueFilter.
     pub filter: Value,
     pub teams: Vec<Team>,
+    /// The workspace's labels (each team's are on the team).
+    pub labels: Vec<Value>,
 }
 
 const TEAM_FIELDS: &str = "id key name states { nodes { id name type position } } \
-    cycles(first: 50, filter: {endsAt: {gt: \"-P60D\"}}) { nodes { id number name startsAt endsAt } }";
+    cycles(first: 50, filter: {endsAt: {gt: \"-P60D\"}}) { nodes { id number name startsAt endsAt } } \
+    members(first: 100) { nodes { id name displayName avatarUrl active } } \
+    labels(first: 100) { nodes { id name color isGroup } }";
 
-/// A team, as the board needs it: its states in Linear's order, and its recent cycles.
+/// A team, as the board needs it: its states in Linear's order, its recent cycles, its people and labels.
 #[derive(Clone, Debug)]
 pub struct Team {
     pub id: String,
@@ -161,6 +180,32 @@ pub struct Team {
     pub name: String,
     pub states: Vec<Value>,
     pub cycles: Vec<Value>,
+    pub members: Vec<Value>,
+    pub labels: Vec<Value>,
+}
+
+impl Scope {
+    /// The people on its teams who can be given a card, by name, each once.
+    pub fn people(&self) -> Vec<Value> {
+        let mut people: Vec<Value> = Vec::new();
+        for m in self.teams.iter().flat_map(|t| &t.members) {
+            if m["active"] != false && !people.iter().any(|p| p["id"] == m["id"]) {
+                people.push(m.clone());
+            }
+        }
+        people.sort_by(|a, b| a["name"].as_str().unwrap_or_default().cmp(b["name"].as_str().unwrap_or_default()));
+        people
+    }
+
+    /// The labels a card on `team` can have: the team's and the workspace's (not label groups).
+    pub fn labels_for<'a>(&'a self, team: &'a Team) -> impl Iterator<Item = &'a Value> {
+        team.labels.iter().chain(&self.labels).filter(|l| l["isGroup"] != true)
+    }
+
+    /// An issue's team on this board.
+    pub fn team_of(&self, issue: &Value) -> Option<&Team> {
+        self.teams.iter().find(|t| issue["team"]["id"] == t.id.as_str())
+    }
 }
 
 impl Linear {
@@ -207,7 +252,10 @@ impl Linear {
     /// A team's board, by its key.
     pub fn team(&self, key: &str) -> anyhow::Result<Scope> {
         let data = self.gql(
-            &format!("query($key: String!) {{ teams(filter: {{key: {{eq: $key}}}}) {{ nodes {{ {TEAM_FIELDS} }} }} }}"),
+            &format!(
+                "query($key: String!) {{ teams(filter: {{key: {{eq: $key}}}}) {{ nodes {{ {TEAM_FIELDS} }} }} \
+                   {WORKSPACE_LABELS} }}"
+            ),
             json!({"key": key}),
         )?;
         let t = data["teams"]["nodes"].get(0).ok_or_else(|| anyhow!("Linear has no team {key} for this key"))?;
@@ -215,15 +263,20 @@ impl Linear {
         Ok(Scope {
             key: team.key.clone(),
             name: team.name.clone(),
+            project: None,
             filter: json!({"team": {"key": {"eq": team.key}}}),
             teams: vec![team],
+            labels: nodes(&data["issueLabels"]),
         })
     }
 
     /// A Linear project's board, by its id: its issues from every team it has.
     pub fn project(&self, id: &str) -> anyhow::Result<Scope> {
         let data = self.gql(
-            &format!("query($id: String!) {{ project(id: $id) {{ id name teams {{ nodes {{ {TEAM_FIELDS} }} }} }} }}"),
+            &format!(
+                "query($id: String!) {{ project(id: $id) {{ id name teams(first: 10) {{ nodes {{ {TEAM_FIELDS} }} }} }} \
+                   {WORKSPACE_LABELS} }}"
+            ),
             json!({"id": id}),
         )?;
         let p = &data["project"];
@@ -232,8 +285,10 @@ impl Linear {
         Ok(Scope {
             key: key_for(name).unwrap_or_else(|| teams.first().map(|t| t.key.clone()).unwrap_or_default()),
             name: name.to_string(),
+            project: p["id"].as_str().map(String::from),
             filter: json!({"project": {"id": {"eq": p["id"]}}}),
             teams,
+            labels: nodes(&data["issueLabels"]),
         })
     }
 
@@ -305,34 +360,101 @@ impl Linear {
         }
         Ok(done["issue"].clone())
     }
+
+    /// issueCreate: the new issue as Linear has it.
+    pub fn create(&self, input: Value) -> anyhow::Result<Value> {
+        let query = format!(
+            "mutation($input: IssueCreateInput!) {{ issueCreate(input: $input) {{ success issue {{ {ISSUE_FIELDS} }} }} }}"
+        );
+        let done = &self.gql(&query, json!({"input": input}))?["issueCreate"];
+        if done["success"] != true {
+            bail!("Linear didn't make the issue");
+        }
+        Ok(done["issue"].clone())
+    }
+
+    /// commentCreate on an issue.
+    pub fn comment(&self, issue: &str, body: &str) -> anyhow::Result<()> {
+        let done = &self.gql(
+            "mutation($input: CommentCreateInput!) { commentCreate(input: $input) { success } }",
+            json!({"input": {"issueId": issue, "body": body}}),
+        )?["commentCreate"];
+        if done["success"] != true {
+            bail!("Linear didn't add the comment");
+        }
+        Ok(())
+    }
+
+    /// An opened card's detail, as the board adds it to the item: `{body, comments, children}`.
+    pub fn detail(&self, id: &str) -> anyhow::Result<Value> {
+        let data =
+            self.gql(&format!("query($id: String!) {{ issue(id: $id) {{ {DETAIL_FIELDS} }} }}"), json!({"id": id}))?;
+        Ok(detail_of(&data["issue"]))
+    }
 }
 
 // ------------------------------------------------------------------ the board
 
-/// One issue as a board item.
-pub fn item(map: &Tracker, issue: &Value) -> Value {
+/// One issue as a board item, with its detail (body, comments, children) once it's been opened.
+pub fn item(map: &Tracker, issue: &Value, detail: Option<&Value>) -> Value {
     let state = &issue["state"];
     let cycle = &issue["cycle"];
     let sprint = match cycle["name"].as_str().filter(|n| !n.is_empty()) {
         Some(name) => json!(name),
         None => cycle["number"].as_u64().map_or(Value::Null, |n| json!(format!("Cycle {n}"))),
     };
-    let owner = issue["assignee"]["displayName"].as_str().or(issue["assignee"]["name"].as_str());
-    json!({
+    let mut out = json!({
         "id": issue["id"], "ref": issue["identifier"],
         "level": if map.is_epic(issue) { "epic" } else { "task" }, "kind": kind_of(issue),
         "title": issue["title"], "state": state["name"],
         "category": map.category(state["type"].as_str().unwrap_or_default(), state["name"].as_str().unwrap_or_default()),
-        "owner": owner, "parent": issue["parent"]["identifier"], "sprint": sprint, "target": issue["dueDate"],
-        "priority": priority_of(issue["priority"].as_i64().unwrap_or(0)),
+        "owner": handle(&issue["assignee"]), "parent": issue["parent"]["identifier"], "sprint": sprint,
+        "target": issue["dueDate"], "priority": priority_of(issue["priority"].as_i64().unwrap_or(0)),
         "rank": rank(issue["sortOrder"].as_f64().unwrap_or(0.0)), "url": issue["url"],
-    })
+        "labels": labels(issue), "estimate": issue["estimate"],
+        "created_at": issue["createdAt"], "updated_at": issue["updatedAt"],
+    });
+    if let Some(Value::Object(d)) = detail {
+        for (k, v) in d {
+            out[k] = v.clone();
+        }
+    }
+    out
+}
+
+/// A Linear user as a board's handle: their display name.
+fn handle(user: &Value) -> Value {
+    user["displayName"].as_str().or(user["name"].as_str()).map_or(Value::Null, |h| json!(h))
+}
+
+fn nodes(connection: &Value) -> Vec<Value> {
+    connection["nodes"].as_array().cloned().unwrap_or_default()
+}
+
+/// An issue's detail as the item carries it: the description as `body`, its comments (oldest first) and
+/// its sub-issues by ref.
+pub fn detail_of(issue: &Value) -> Value {
+    let mut comments = nodes(&issue["comments"]);
+    comments
+        .sort_by(|a, b| a["createdAt"].as_str().unwrap_or_default().cmp(b["createdAt"].as_str().unwrap_or_default()));
+    let comments: Vec<Value> = comments
+        .iter()
+        .map(|c| json!({"author": handle(&c["user"]), "body": c["body"], "at": c["createdAt"]}))
+        .collect();
+    let children: Vec<Value> = nodes(&issue["children"]).iter().map(|c| c["identifier"].clone()).collect();
+    json!({"body": issue["description"].as_str().unwrap_or_default(), "comments": comments, "children": children})
 }
 
 /// The board for a team or a project, from its issues by id, cut to `max` bytes: the longest-closed
 /// issues go first, then the least recently changed, and the project says how many. A project across
 /// teams has each team's states as columns, by name, the first team's order first.
-pub fn board(map: &Tracker, scope: &Scope, issues: &HashMap<String, Value>, max: usize) -> Value {
+pub fn board(
+    map: &Tracker,
+    scope: &Scope,
+    issues: &HashMap<String, Value>,
+    details: &HashMap<String, Value>,
+    max: usize,
+) -> Value {
     let mut states: Vec<Value> = Vec::new();
     for s in scope.teams.iter().flat_map(|t| &t.states) {
         let name = s["name"].as_str().unwrap_or_default();
@@ -373,10 +495,24 @@ pub fn board(map: &Tracker, scope: &Scope, issues: &HashMap<String, Value>, max:
             .then_with(|| b["updatedAt"].as_str().unwrap_or_default().cmp(a["updatedAt"].as_str().unwrap_or_default()))
             .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
     });
-    let mut items: Vec<Value> = ordered.into_iter().map(|i| item(map, i)).collect();
+    let mut items: Vec<Value> =
+        ordered.into_iter().map(|i| item(map, i, i["id"].as_str().and_then(|id| details.get(id)))).collect();
+    let people: Vec<Value> = scope
+        .people()
+        .iter()
+        .map(|p| json!({"handle": handle(p), "name": p["name"], "avatar": p["avatarUrl"]}))
+        .collect();
+    let mut labels: Vec<Value> = Vec::new();
+    for l in scope.teams.iter().flat_map(|t| scope.labels_for(t)) {
+        if !labels.iter().any(|x| x["name"] == l["name"]) {
+            labels.push(json!({"name": l["name"], "color": l["color"]}));
+        }
+    }
+    labels.sort_by(|a, b| a["name"].as_str().unwrap_or_default().cmp(b["name"].as_str().unwrap_or_default()));
     let mut out = json!({
         "project": {"key": scope.key, "title": scope.name, "leading_tool": "linear"},
-        "states": states, "items": [], "groups": {"sprints": sprints, "milestones": milestones},
+        "states": states, "items": [],
+        "groups": {"sprints": sprints, "milestones": milestones, "people": people, "labels": labels},
     });
     let mut size = serde_json::to_vec(&out).map_or(0, |b| b.len()) + 200;
     let mut kept = Vec::new();
@@ -441,6 +577,8 @@ fn team_of(t: &Value) -> Team {
         name: t["name"].as_str().unwrap_or(key).to_string(),
         states,
         cycles,
+        members: nodes(&t["members"]),
+        labels: nodes(&t["labels"]),
     }
 }
 
@@ -472,28 +610,90 @@ pub fn by_id(issues: Vec<Value>) -> HashMap<String, Value> {
     issues.into_iter().filter_map(|i| Some((i["id"].as_str()?.to_string(), i))).collect()
 }
 
-/// A map of fields an edit may set: title, priority and target, as Linear's input. Anything else says why
-/// it can't.
-pub fn edit_input(fields: &Map<String, Value>) -> Result<Value, String> {
+/// A card's fields as Linear's issue input, for an edit or a new card on `team`: title, body, state,
+/// owner (a handle, or null), priority, target, estimate, labels (names), sprint (an id or a name, or null)
+/// and parent (a ref, or null), each checked against the board. Anything else, or a value the board
+/// doesn't have, says why.
+pub fn issue_input(
+    fields: &Map<String, Value>,
+    scope: &Scope,
+    team: &Team,
+    issues: &HashMap<String, Value>,
+) -> Result<Value, String> {
+    fn text(v: &Value) -> Option<&str> {
+        v.as_str().map(str::trim).filter(|t| !t.is_empty())
+    }
+    // a value as a person typed it, for saying why it's refused
+    fn said(v: &Value) -> String {
+        v.as_str().map_or_else(|| v.to_string(), String::from)
+    }
+    let date = Regex::new(r"^\d{4}-\d{2}-\d{2}$").expect("compiles");
     let mut input = Map::new();
     for (field, value) in fields {
-        match field.as_str() {
-            "title" => {
-                let title = value.as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or("a title can't be empty")?;
-                input.insert("title".into(), json!(title));
+        let (to, v) = match field.as_str() {
+            "title" => ("title", json!(text(value).ok_or("a title can't be empty")?)),
+            "body" => ("description", json!(value.as_str().unwrap_or_default())),
+            "state" => {
+                let state = team.states.iter().find(|s| s["name"] == *value);
+                let state = state.ok_or_else(|| format!("{} isn't one of {}'s states", said(value), team.key))?;
+                ("stateId", state["id"].clone())
             }
+            "owner" => match text(value) {
+                None => ("assigneeId", Value::Null),
+                Some(h) => {
+                    let person = scope.people().into_iter().find(|p| handle(p) == h || p["id"] == h);
+                    let person = person.ok_or_else(|| format!("{h} isn't one of {}'s people", team.key))?;
+                    ("assigneeId", person["id"].clone())
+                }
+            },
             "priority" => {
-                let n = priority_number(value.as_str().unwrap_or_default())
-                    .ok_or_else(|| format!("{value} isn't a priority: urgent, high, normal, low or none"))?;
-                input.insert("priority".into(), json!(n));
+                let word = value.as_str().unwrap_or("none");
+                let n = priority_number(word)
+                    .ok_or_else(|| format!("{} isn't a priority: urgent, high, normal, low or none", said(value)))?;
+                ("priority", json!(n))
             }
-            "target" => {
-                input.insert("dueDate".into(), value.clone());
+            "target" => match text(value) {
+                None => ("dueDate", Value::Null),
+                Some(d) if date.is_match(d) => ("dueDate", json!(d)),
+                Some(d) => return Err(format!("{d} isn't a date: YYYY-MM-DD")),
+            },
+            "estimate" => match value {
+                Value::Null => ("estimate", Value::Null),
+                Value::Number(n) => ("estimate", json!(n.as_f64().unwrap_or(0.0).round() as i64)),
+                other => return Err(format!("{} isn't an estimate: a number", said(other))),
+            },
+            "labels" => {
+                let names = value.as_array().ok_or("labels are a list of names")?;
+                let mut ids = Vec::new();
+                for name in names {
+                    let found = scope.labels_for(team).find(|l| l["name"] == *name);
+                    let found = found.ok_or_else(|| format!("{} isn't one of {}'s labels", said(name), team.key))?;
+                    ids.push(found["id"].clone());
+                }
+                ("labelIds", Value::Array(ids))
             }
-            other => {
-                return Err(format!("{other} is changed in Linear itself: this board edits title, priority and target"))
-            }
-        }
+            "sprint" => match text(value) {
+                None => ("cycleId", Value::Null),
+                Some(s) => {
+                    let named = |c: &Value| {
+                        c["id"] == s
+                            || c["name"] == s
+                            || c["number"].as_u64().is_some_and(|n| format!("Cycle {n}") == s)
+                    };
+                    let cycle = team.cycles.iter().find(|c| named(c));
+                    ("cycleId", cycle.ok_or_else(|| format!("{s} isn't one of {}'s sprints", team.key))?["id"].clone())
+                }
+            },
+            "parent" => match text(value) {
+                None => ("parentId", Value::Null),
+                Some(r) => {
+                    let parent = issues.values().find(|i| i["identifier"] == r || i["id"] == r);
+                    ("parentId", parent.ok_or_else(|| format!("{r} isn't on this board"))?["id"].clone())
+                }
+            },
+            other => return Err(format!("{other} isn't something a Linear card has here")),
+        };
+        input.insert(to.into(), v);
     }
     if input.is_empty() {
         return Err("nothing to change".into());
@@ -509,8 +709,43 @@ mod tests {
         json!({"id": id, "identifier": format!("ALA-{id}"), "title": format!("Issue {id}"), "priority": 2,
                "dueDate": null, "url": format!("https://linear.app/a/issue/ALA-{id}"), "updatedAt": updated,
                "sortOrder": order, "state": {"id": format!("s-{}", state.1), "name": state.1, "type": state.0},
-               "assignee": {"name": "James Briggs", "displayName": "james"}, "labels": {"nodes": []},
+               "assignee": {"id": "u1", "name": "James Briggs", "displayName": "james"}, "labels": {"nodes": []},
+               "team": {"id": "t"}, "estimate": null, "createdAt": "2026-10-01T00:00:00.000Z",
                "parent": null, "cycle": null, "projectMilestone": null})
+    }
+
+    /// ALA (Spark): two states, one cycle, two people (one gone), a team label and a label group; the
+    /// workspace has a label of its own.
+    fn scope() -> Scope {
+        let team = Team {
+            id: "t".into(),
+            key: "ALA".into(),
+            name: "Spark".into(),
+            states: vec![
+                json!({"id": "s-Todo", "name": "Todo", "type": "unstarted"}),
+                json!({"id": "s-In Review", "name": "In Review", "type": "started"}),
+            ],
+            cycles: vec![json!({"id": "c1", "number": 41, "name": null, "startsAt": "2026-10-05T00:00:00.000Z",
+                                "endsAt": "2026-10-19T00:00:00.000Z"})],
+            members: vec![
+                json!({"id": "u1", "name": "James Briggs", "displayName": "james",
+                       "avatarUrl": "https://public.linear.app/j.png", "active": true}),
+                json!({"id": "u2", "name": "Ada Lovelace", "displayName": "ada", "avatarUrl": null, "active": true}),
+                json!({"id": "u3", "name": "Gone Person", "displayName": "gone", "avatarUrl": null, "active": false}),
+            ],
+            labels: vec![
+                json!({"id": "l-bug", "name": "Bug", "color": "#eb5757", "isGroup": false}),
+                json!({"id": "l-area", "name": "Area", "color": "#000000", "isGroup": true}),
+            ],
+        };
+        Scope {
+            key: "V".into(),
+            name: "Voice".into(),
+            project: None,
+            filter: json!({}),
+            teams: vec![team],
+            labels: vec![json!({"id": "l-feat", "name": "Feature", "color": "#bb87fc", "isGroup": false})],
+        }
     }
 
     #[test]
@@ -559,24 +794,16 @@ mod tests {
     #[test]
     fn the_board_has_the_teams_states_and_its_issues() {
         let map = Tracker::default();
-        let team = Team {
-            id: "t".into(),
-            key: "ALA".into(),
-            name: "Spark".into(),
-            states: vec![
-                json!({"id": "s-Todo", "name": "Todo", "type": "unstarted"}),
-                json!({"id": "s-In Review", "name": "In Review", "type": "started"}),
-            ],
-            cycles: vec![json!({"id": "c1", "number": 41, "name": null, "startsAt": "2026-10-05T00:00:00.000Z",
-                                "endsAt": "2026-10-19T00:00:00.000Z"})],
-        };
+        let scope = scope();
         let mut a = issue("1", ("started", "In Review"), 1.0, "2026-10-08T01:00:00.000Z");
-        a["cycle"] = team.cycles[0].clone();
+        a["cycle"] = scope.teams[0].cycles[0].clone();
+        a["labels"] = json!({"nodes": [{"id": "l-bug", "name": "Bug"}]});
+        a["estimate"] = json!(3);
         a["projectMilestone"] = json!({"id": "m1", "name": "Beta", "targetDate": "2026-11-01"});
         let b = issue("2", ("completed", "Done"), 2.0, "2026-10-07T00:00:00.000Z");
         let issues = by_id(vec![a, b]);
-        let scope = Scope { key: "V".into(), name: "Voice".into(), filter: json!({}), teams: vec![team.clone()] };
-        let board = board(&map, &scope, &issues, CONTENT_MAX);
+        let opened = HashMap::from([("2".to_string(), json!({"body": "Why", "comments": [], "children": ["ALA-9"]}))]);
+        let board = board(&map, &scope, &issues, &opened, CONTENT_MAX);
         assert_eq!(board["project"], json!({"key": "V", "title": "Voice", "leading_tool": "linear"}));
         assert_eq!(
             board["states"],
@@ -588,16 +815,34 @@ mod tests {
             (Some("ALA-1"), Some("review"), Some("Cycle 41"))
         );
         assert_eq!((first["owner"].as_str(), first["priority"].as_str()), (Some("james"), Some("high")));
+        assert_eq!((&first["labels"], &first["estimate"]), (&json!(["Bug"]), &json!(3)));
+        assert_eq!(
+            (first["created_at"].as_str(), first["updated_at"].as_str()),
+            (Some("2026-10-01T00:00:00.000Z"), Some("2026-10-08T01:00:00.000Z"))
+        );
+        assert!(first.get("body").is_none(), "a card's detail comes once it's opened");
         assert_eq!(board["items"][1]["category"], "done");
+        assert_eq!((&board["items"][1]["body"], &board["items"][1]["children"]), (&json!("Why"), &json!(["ALA-9"])));
+        // the people who can be given a card, and the labels a card can have
+        assert_eq!(
+            board["groups"]["people"],
+            json!([{"handle": "ada", "name": "Ada Lovelace", "avatar": null},
+                   {"handle": "james", "name": "James Briggs", "avatar": "https://public.linear.app/j.png"}])
+        );
+        assert_eq!(
+            board["groups"]["labels"],
+            json!([{"name": "Bug", "color": "#eb5757"}, {"name": "Feature", "color": "#bb87fc"}])
+        );
         assert_eq!(
             board["groups"]["sprints"],
             json!([{"id": "c1", "name": "Cycle 41", "start": "2026-10-05", "end": "2026-10-19"}])
         );
         assert_eq!(board["groups"]["milestones"], json!([{"id": "m1", "name": "Beta", "target": "2026-11-01"}]));
         // cut to fit: the closed issue goes first
-        let open_only = super::board(&map, &scope, &by_id(vec![issues["1"].clone()]), CONTENT_MAX);
+        let none = HashMap::new();
+        let open_only = super::board(&map, &scope, &by_id(vec![issues["1"].clone()]), &none, CONTENT_MAX);
         let max = serde_json::to_vec(&open_only).unwrap().len() + 200 + 5;
-        let small = super::board(&map, &scope, &issues, max);
+        let small = super::board(&map, &scope, &issues, &none, max);
         assert_eq!(small["items"].as_array().unwrap().len(), 1);
         assert_eq!(small["items"][0]["ref"], "ALA-1");
         assert_eq!(small["project"]["note"], "1 older issue left out: Linear has them");
@@ -618,14 +863,57 @@ mod tests {
     }
 
     #[test]
-    fn edits_take_title_priority_and_target() {
-        let fields = |v: Value| v.as_object().unwrap().clone();
+    fn a_cards_fields_are_checked_against_the_board() {
+        let scope = scope();
+        let team = &scope.teams[0];
+        let issues = by_id(vec![issue("7", ("unstarted", "Todo"), 1.0, "2026-10-08T00:00:00.000Z")]);
+        let input = |v: Value| issue_input(v.as_object().unwrap(), &scope, team, &issues);
         assert_eq!(
-            edit_input(&fields(json!({"title": " New ", "priority": "low", "target": "2026-10-20"}))).unwrap(),
-            json!({"title": "New", "priority": 4, "dueDate": "2026-10-20"})
+            input(json!({"title": " New ", "priority": "low", "target": "2026-10-20", "body": "Steps:\n1. …"}))
+                .unwrap(),
+            json!({"title": "New", "priority": 4, "dueDate": "2026-10-20", "description": "Steps:\n1. …"})
         );
-        assert!(edit_input(&fields(json!({"owner": "x"}))).unwrap_err().contains("owner is changed in Linear itself"));
-        assert!(edit_input(&fields(json!({"priority": "huge"}))).unwrap_err().contains("isn't a priority"));
-        assert!(edit_input(&fields(json!({"title": ""}))).unwrap_err().contains("can't be empty"));
+        assert_eq!(
+            input(json!({"owner": "ada", "labels": ["Bug", "Feature"], "sprint": "Cycle 41", "estimate": 2,
+                         "parent": "ALA-7", "state": "In Review"}))
+            .unwrap(),
+            json!({"assigneeId": "u2", "labelIds": ["l-bug", "l-feat"], "cycleId": "c1", "estimate": 2,
+                   "parentId": "7", "stateId": "s-In Review"})
+        );
+        assert_eq!(
+            input(json!({"owner": null, "sprint": null, "parent": null, "target": null, "priority": "none"})).unwrap(),
+            json!({"assigneeId": null, "cycleId": null, "parentId": null, "dueDate": null, "priority": 0})
+        );
+        assert_eq!(
+            input(json!({"sprint": "c1", "priority": "medium"})).unwrap(),
+            json!({"cycleId": "c1", "priority": 3})
+        );
+        let refused = |v: Value| input(v).unwrap_err();
+        assert_eq!(refused(json!({"owner": "gone"})), "gone isn't one of ALA's people");
+        assert_eq!(refused(json!({"labels": ["Area"]})), "Area isn't one of ALA's labels");
+        assert_eq!(refused(json!({"sprint": "Cycle 2"})), "Cycle 2 isn't one of ALA's sprints");
+        assert_eq!(refused(json!({"parent": "ALA-99"})), "ALA-99 isn't on this board");
+        assert_eq!(refused(json!({"state": "Shipped"})), "Shipped isn't one of ALA's states");
+        assert_eq!(refused(json!({"target": "soon"})), "soon isn't a date: YYYY-MM-DD");
+        assert_eq!(refused(json!({"priority": "huge"})), "huge isn't a priority: urgent, high, normal, low or none");
+        assert_eq!(refused(json!({"title": ""})), "a title can't be empty");
+        assert_eq!(refused(json!({"color": "red"})), "color isn't something a Linear card has here");
+        assert_eq!(refused(json!({})), "nothing to change");
+    }
+
+    #[test]
+    fn a_cards_detail_is_its_body_comments_and_children() {
+        let detail = detail_of(&json!({
+            "id": "7", "description": null,
+            "children": {"nodes": [{"identifier": "ALA-8"}]},
+            "comments": {"nodes": [
+                {"body": "second", "createdAt": "2026-10-09T02:00:00.000Z", "user": {"name": "Ada Lovelace", "displayName": "ada"}},
+                {"body": "first", "createdAt": "2026-10-09T01:00:00.000Z", "user": null}]}}));
+        assert_eq!(
+            detail,
+            json!({"body": "", "children": ["ALA-8"], "comments": [
+                {"author": null, "body": "first", "at": "2026-10-09T01:00:00.000Z"},
+                {"author": "ada", "body": "second", "at": "2026-10-09T02:00:00.000Z"}]})
+        );
     }
 }

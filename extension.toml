@@ -5,9 +5,9 @@
 [extension]
 id = "linear"
 name = "Linear"
-version = "0.3.0"
+version = "0.4.0"
 publisher = "aurelio"
-summary = "A Linear team's or project's board in the apps, drawn by Pointman's own board: moves, ranks and edits go to Linear."
+summary = "A Linear team's or project's board in the apps, drawn by Pointman's own board, with full control: every change goes to Linear."
 node = ">=0.1,<1"
 platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
 
@@ -34,7 +34,7 @@ type = "object"
 
 [settings.properties.refresh_seconds]
 type = "integer"
-default = 60
+default = 30
 description = "How often an open board asks Linear what changed"
 
 [settings.properties.api_url]
