@@ -1,58 +1,68 @@
 # linear
 
-Linear on Pointman's machines (MB-343, Pointman's docs/dev/panes.md): a Linear team's or project's board as a pane,
-drawn by the apps' own board, with the same columns, cards, filters and drag as Pointman's projects. Linear's
-workflow states become columns in the projects syntax's seven categories, through the same map core's Linear
-mirror reads (tracker.toml, a copy built in). Linear stays the source of truth, and the board has full
-control of it: a move, a rank, an edit of any field, a new card or a comment goes to Linear, and the card
-settles where Linear puts it. If Linear says no, the card snaps back with Linear's reason.
+A Pointman extension that opens a Linear team's or project's board in the apps. Pointman draws it with
+its own project board: the same columns, cards, filters and drag. Linear stays the source of truth, and
+the board has full control of it. A move, a rank, an edit of any field, a new card or a comment goes to
+Linear, and the card settles where Linear puts it. If Linear says no, the card snaps back with Linear's
+reason.
 
-Linear is asked with the vault's API key (`/linear add`), from the node, so the apps never hold it.
+Linear is asked from the node, with the vault's API key, so the apps never hold it.
 
 ```
 pointman add linear
 ```
 
-## The board pane
+## Getting started
 
-`[[panes]] id = "board"`, `format = "board"`. Opened with a team, `{team: "ALA"}`, or a Linear project,
-`{project: "<id>"}`: a project connected in Pointman's Project pane keeps that target, and opens the board
-by it. A project's issues can be in several teams: its columns are each team's states by name (the first
-team's order first), and a move sets the issue's own team's state of that name.
+1. **Add a key:** `/linear add` in any thread opens a form for a personal API key from linear.app
+   (Settings › Security & access › New API key). It's sealed into the vault as `linear.<label>` for every
+   node, and never posted. Pointman asks Linear as the key's owner.
+2. **Connect a board:** in a project's pane, **Add a project board** lists the Linear teams and open
+   projects the key sees (`/linear boards` lists them in a thread). Pick one, and the project opens its
+   board.
 
-- **Columns:** the team's workflow states in Linear's order, each with its category. For example, In
-  Review is `review`, and a started state named for a hold is `active`.
+## The board
+
+A board opens by a team, `{team: "ALA"}`, or by a Linear project, `{project: "<id>"}`. A project's issues
+can be in several teams: its columns are each team's states by name (the first team's order first), and a
+move sets the issue's own team's state of that name.
+
+- **Columns:** the team's workflow states in Linear's order. Each falls in one of Pointman's seven
+  categories (triage, backlog, todo, active, review, done, dropped): In Review is `review`, say, and a
+  started state named for a hold is `active`, held.
 - **Cards:** the team's or project's open issues, and those closed in the last 14 days. Each card has its
   identifier, epic or task (the EPIC label or an "[EPIC] …" title), kind (by the Bug and Feature labels),
-  state, owner (the assignee's handle, one of `people`), parent, cycle, due date, priority, labels,
-  estimate, Linear's order as `rank`, url, `created_at` and `updated_at`.
-- **An opened card** also has its `body` (the description, markdown), `comments` (`{author, body, at}`,
-  oldest first) and `children` (sub-issues' refs).
-- **Groups:** the teams' recent cycles as sprints, the issues' project milestones, `people`
-  (`{handle, name, avatar}`: who a card can be given to) and `labels` (`{name, color}`: the teams' and the
-  workspace's).
-- **Size:** a board over a frame's 1 MiB leaves out the longest-closed issues first, then the least
-  recently changed, and `project.note` says how many.
-- **Gestures:**
-  - `move {item, to}` sets the state.
-  - `rank {item, before | after}` sets `sortOrder` between the neighbours in that column.
-  - `edit {item, fields}` takes `title`, `body`, `state`, `owner` (a handle, or null), `priority`
-    (urgent, high, normal or medium, low, none), `target` (YYYY-MM-DD, or null), `estimate`, `labels`
-    (names), `sprint` (an id or name, or null) and `parent` (a ref, or null), each checked against the
-    board first.
-  - `open {item}` adds the card's detail (body, comments, children) to it, as a patch.
-  - `comment {item, body}` adds a comment.
-  - `create {fields}` makes an issue with `title` and any of `edit`'s fields, on `team` (a key) or the
-    board's first team, and in the Linear project when the board is one.
-- **Keeping current:** every 30 seconds (`refresh_seconds`), an open board asks Linear what changed since its
-  last look, with the detail of opened cards that changed, and all of it (teams' people, labels and
-  sprints too) every ten minutes. Only the change goes to the apps, through the SDK's `show_board`.
+  state, owner (the assignee), parent, cycle, due date, priority, labels, estimate, Linear's order, and a
+  link to the issue.
+- **An opened card** also has its description, its comments (oldest first) and its sub-issues.
+- **Sprints and milestones:** the teams' recent cycles are its sprints, and the issues' project milestones
+  its milestones. Its people are who a card can be given to, and its labels the teams' and the
+  workspace's.
+- **Size:** a board too big to send at once leaves out the longest-closed issues first, then the least
+  recently changed, and the board says how many.
+- **Keeping current:** every 30 seconds (`refresh_seconds`), an open board asks Linear what changed since
+  its last look, and everything (teams' people, labels and sprints too) every ten minutes. Only what
+  changed goes to the apps.
 
-## What can be connected
+### What the board can do
 
-`linear.boards` (`/linear boards`) lists the teams the key sees, then its Linear projects that aren't
-completed or canceled, each by name. It's the board's `targets`, so the apps' **Add a project board** runs
-it to offer what can be connected:
+| Gesture | What goes to Linear |
+|---|---|
+| `move {item, to}` | the issue's state |
+| `rank {item, before \| after}` | its order (`sortOrder`) between its neighbours in that column |
+| `edit {item, fields}` | `title`, `body`, `state`, `owner` (a handle, or null), `priority` (urgent, high, normal or medium, low, none), `target` (YYYY-MM-DD, or null), `estimate`, `labels` (names), `sprint` (an id or name, or null) and `parent` (a ref, or null), each checked against the board first |
+| `open {item}` | nothing: it adds the card's description, comments and sub-issues |
+| `comment {item, body}` | a comment |
+| `create {fields}` | a new issue with `title` and any of `edit`'s fields, on `team` (a key) or the board's first team, and in the Linear project when the board is one |
+
+## Commands
+
+| Kind | Slash | What |
+|---|---|---|
+| `linear.add` | `/linear add` | Add a Linear API key for every node |
+| `linear.boards` | `/linear boards` | The Linear teams and open projects whose boards can be connected |
+
+`linear.boards` answers with each one's target, name, suggested project key and kind:
 
 ```
 {targets: [{target: {team: "ALA"}, name: "Spark", key: "ALA", kind: "team"},
@@ -60,13 +70,27 @@ it to offer what can be connected:
  text: "1 Linear team: Spark (ALA). 1 Linear project: Spark Voice."}
 ```
 
-`key` is the project key it suggests: a team's own, or a project name's initials (a one-word name's first
-three letters), as the apps suggest one; none when the name gives no key.
+The key is a team's own, or a project name's initials (a one-word name's first three letters); none when
+the name gives no key.
 
-Settings: `refresh_seconds` (30), and `api_url` (Linear's GraphQL endpoint).
+## Settings
 
-## Building
+| Setting | Default | |
+|---|---|---|
+| `refresh_seconds` | 30 | How often an open board asks Linear what changed |
+| `api_url` | `https://api.linear.app/graphql` | Linear's GraphQL endpoint |
 
-`cargo test` runs it against a stand-in node and a stand-in Linear: a GraphQL server on a free local port
-that answers as Linear's API would. Releases are built per platform by `.github/workflows/release.yml`,
-as for every compiled extension.
+## Building and testing
+
+```
+cargo test
+```
+
+The tests run it against a stand-in node and a stand-in Linear: a GraphQL server on a free local port that
+answers as Linear's API would. To release, bump `version` in extension.toml and Cargo.toml and push a tag
+for it (`git tag v0.4.3 && git push origin v0.4.3`). The release workflow builds each platform (macOS arm64
+and x86_64, Linux x86_64 and arm64) and attaches it, and the marketplace lists it within 30 minutes.
+
+## Licence
+
+MIT. See `LICENSE`.
