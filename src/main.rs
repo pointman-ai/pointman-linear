@@ -14,6 +14,8 @@ use linear::{
     board, by_id, issue_input, newest, project_filter, sort_between, targets, team_filter, Linear, Scope, Tracker,
     CONTENT_MAX,
 };
+use pointman_extension::protocol::PaneOpenResponse;
+use pointman_extension::v1::PaneInput;
 use pointman_extension::{Extension, Handle, Job, Pane, Refused};
 use regex::Regex;
 use serde_json::{json, Value};
@@ -59,11 +61,7 @@ fn relist(age: Option<Duration>, asking: bool, empty: bool) -> Relist {
 }
 
 fn list(h: &Handle) -> Option<Vec<String>> {
-    let got = h.request("secret.list", json!({"prefix": "linear."})).ok()?;
-    let mut names: Vec<String> = got["names"]
-        .as_array()
-        .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-        .unwrap_or_default();
+    let mut names = h.secrets("linear.").ok()?;
     names.sort();
     Some(names)
 }
@@ -167,7 +165,7 @@ impl Boards {
 
     /// pane.open: a team or a Linear project, from the target (a connected project's): {team: key} or
     /// {project: id}.
-    fn opened(&self, p: &Pane) -> anyhow::Result<Value> {
+    fn opened(&self, p: &Pane) -> anyhow::Result<PaneOpenResponse> {
         let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
         let started = Instant::now();
         let linear = self.linear()?;
@@ -204,7 +202,7 @@ impl Boards {
         };
         let content = self.content(&shown);
         self.open().insert(p.id().to_string(), shown);
-        Ok(json!({"title": title, "board": content}))
+        Ok(PaneOpenResponse::board(&content).titled(&title))
     }
 
     /// Puts what Linear answered on the board (an issue as it is after a change, a card's detail), and
@@ -220,7 +218,7 @@ impl Boards {
         if let Some((id, detail)) = detail {
             shown.keep_detail(id, detail);
         }
-        p.show_board(self.content(shown));
+        p.show_board(&self.content(shown));
     }
 
     /// A gesture on the board: move, rank, edit, open (the card's detail), comment or create. Linear makes
@@ -407,9 +405,19 @@ impl Boards {
                 }
             }
             shown.since = newest(&shown.issues).or(shown.since.take());
-            p.show_board(self.content(shown));
+            p.show_board(&self.content(shown));
         }
     }
+}
+
+/// A board's input as one JSON object, its kind beside its fields, as `input` reads it.
+fn gesture(event: &PaneInput) -> Value {
+    let mut out = match event.json() {
+        Value::Object(fields) => Value::Object(fields),
+        _ => json!({}),
+    };
+    out["kind"] = json!(event.kind);
+    out
 }
 
 /// A call's answer from its thread (one that panicked, as an error).
@@ -451,7 +459,7 @@ fn main() -> anyhow::Result<()> {
     ext.pane("board", move |p: &Pane| {
         let answer = b.opened(p)?;
         let on = b.clone();
-        p.on_input(move |p: &Pane, event: &Value| on.input(p, event));
+        p.on_input(move |p: &Pane, event: &PaneInput| on.input(p, &gesture(event)));
         let gone = b.clone();
         p.on_close(move |p: &Pane, _: &str| {
             gone.open().remove(p.id());
