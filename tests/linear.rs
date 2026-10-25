@@ -356,6 +356,16 @@ fn serve(stream: TcpStream, fake: &Mutex<Fake>) {
     );
 }
 
+/// The cards a pane.edit puts, as the extension sent them.
+fn put_items(edit: &Value) -> Vec<Value> {
+    let edits = edit["edits"].as_array().unwrap();
+    edits
+        .iter()
+        .flat_map(|e| e["putItems"]["items"].as_array().cloned().unwrap_or_default())
+        .map(|i| i["board"].clone())
+        .collect()
+}
+
 fn node(url: &str, key: &str, settings: Value) -> StandIn {
     let mut s = json!({"api_url": url, "refresh_seconds": 1});
     s.as_object_mut().unwrap().extend(settings.as_object().unwrap().clone());
@@ -372,9 +382,9 @@ fn a_teams_board_opens_with_its_states_and_issues() {
     let (url, _fake) = linear();
     let node = node(&url, KEY, json!({}));
     let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
-    assert_eq!(board.format().as_deref(), Some("board"));
+    assert_eq!(board.format_word(), Some("board"));
     assert_eq!(board.title().as_deref(), Some("Spark · Linear"));
-    let content = board.content();
+    let content = board.board();
     assert_eq!(content["project"], json!({"key": "ALA", "title": "Spark", "leading_tool": "linear"}));
     let states: Vec<(String, String)> = content["states"]
         .as_array()
@@ -411,30 +421,31 @@ fn moves_ranks_and_edits_go_to_linear() {
     let (url, fake) = linear();
     let node = node(&url, KEY, json!({}));
     let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
-    board.input(json!({"kind": "move", "item": "lin_1", "to": "In Review"})).unwrap();
+    board.input_json(json!({"kind": "move", "item": "lin_1", "to": "In Review"})).unwrap();
     assert_eq!(board.item("lin_1").unwrap()["category"], "review");
     let update = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
     assert_eq!(update.1, json!({"id": "lin_1", "input": {"stateId": "st-In Review"}}));
     // only what changed went out
     let (method, last) = board.frames().pop().unwrap();
-    assert_eq!(method, "pane.patch");
-    let paths: Vec<&str> = last["patch"].as_array().unwrap().iter().map(|o| o["path"].as_str().unwrap()).collect();
-    assert_eq!(paths, ["/i/lin_1/category", "/i/lin_1/state", "/i/lin_1/updated_at"]);
+    assert_eq!(method, "pane.edit");
+    let put = put_items(&last);
+    assert_eq!(put.iter().map(|i| i["id"].as_str().unwrap()).collect::<Vec<_>>(), ["lin_1"]);
+    assert_eq!((put[0]["state"].as_str(), put[0]["category"].as_str()), (Some("In Review"), Some("review")));
 
     // just before ALA-3 in In Review (sortOrder 1): between nothing and 1
-    board.input(json!({"kind": "rank", "item": "lin_1", "before": "lin_3"})).unwrap();
+    board.input_json(json!({"kind": "rank", "item": "lin_1", "before": "lin_3"})).unwrap();
     let update = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
     assert_eq!(update.1["input"], json!({"sortOrder": 0.0}));
     assert!(board.item("lin_1").unwrap()["rank"].as_str() < board.item("lin_3").unwrap()["rank"].as_str());
 
     board
-        .input(json!({"kind": "edit", "item": "lin_2", "fields": {"title": "Renamed", "priority": "urgent"}}))
+        .input_json(json!({"kind": "edit", "item": "lin_2", "fields": {"title": "Renamed", "priority": "urgent"}}))
         .unwrap();
     assert_eq!(
         (board.item("lin_2").unwrap()["title"].as_str(), board.item("lin_2").unwrap()["priority"].as_str()),
         (Some("Renamed"), Some("urgent"))
     );
-    board.input(json!({"kind": "open", "item": "lin_2"})).unwrap();
+    board.input_json(json!({"kind": "open", "item": "lin_2"})).unwrap();
     assert!(board.problems().is_empty(), "{:?}", board.problems());
 }
 
@@ -444,14 +455,14 @@ fn what_linear_refuses_snaps_back_with_its_reason() {
     fake.lock().unwrap().refuse = Some(("lin_2".into(), "Parent issues close when their sub-issues do".into()));
     let node = node(&url, KEY, json!({}));
     let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
-    let refused = board.input(json!({"kind": "move", "item": "lin_2", "to": "Done"})).unwrap_err();
+    let refused = board.input_json(json!({"kind": "move", "item": "lin_2", "to": "Done"})).unwrap_err();
     assert_eq!(refused.message, "Linear: Parent issues close when their sub-issues do");
     assert_eq!(board.item("lin_2").unwrap()["state"], "In Progress");
-    let no_state = board.input(json!({"kind": "move", "item": "lin_1", "to": "Shipped"})).unwrap_err();
+    let no_state = board.input_json(json!({"kind": "move", "item": "lin_1", "to": "Shipped"})).unwrap_err();
     assert_eq!(no_state.message, "Shipped isn't one of ALA's states");
-    let owner = board.input(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": "loupe"}})).unwrap_err();
+    let owner = board.input_json(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": "loupe"}})).unwrap_err();
     assert_eq!(owner.message, "loupe isn't one of ALA's people");
-    let gone = board.input(json!({"kind": "move", "item": "lin_99", "to": "Done"})).unwrap_err();
+    let gone = board.input_json(json!({"kind": "move", "item": "lin_99", "to": "Done"})).unwrap_err();
     assert_eq!(gone.message, "lin_99 isn't on this board");
     assert!(board.frames().is_empty(), "{:?}", board.frames());
 }
@@ -460,7 +471,7 @@ fn what_linear_refuses_snaps_back_with_its_reason() {
 fn linears_changes_reach_an_open_board() {
     let (url, fake) = linear();
     let node = node(&url, KEY, json!({}));
-    let options = PaneOptions { context: json!({}), ..Default::default() };
+    let options = PaneOptions::default();
     let board = node.open_pane_with("board", json!({"team": "ALA"}), options).unwrap();
     {
         let mut f = fake.lock().unwrap();
@@ -474,11 +485,12 @@ fn linears_changes_reach_an_open_board() {
         .wait(WAIT, |b| b.item("lin_5").is_some() && b.item("lin_2").unwrap()["title"] == "Changed in Linear")
         .unwrap();
     // only what changed: ALA-2's title, and ALA-5 added
-    let patches: Vec<Value> = board.frames().into_iter().filter(|(m, _)| m == "pane.patch").map(|(_, p)| p).collect();
-    let ops: Vec<Value> = patches.iter().flat_map(|p| p["patch"].as_array().unwrap().clone()).collect();
-    assert!(ops.iter().any(|o| o["path"] == "/i/lin_2/title"), "{ops:?}");
-    assert!(ops.iter().any(|o| o["path"] == "/board/items/-" && o["value"]["ref"] == "ALA-5"), "{ops:?}");
-    assert!(board.frames().iter().all(|(m, _)| m == "pane.patch"));
+    let put: Vec<Value> =
+        board.frames().iter().filter(|(m, _)| m == "pane.edit").flat_map(|(_, p)| put_items(p)).collect();
+    assert!(put.iter().any(|i| i["id"] == "lin_2" && i["title"] == "Changed in Linear"), "{put:?}");
+    assert!(put.iter().any(|i| i["ref"] == "ALA-5"), "{put:?}");
+    assert!(put.iter().all(|i| i["id"] == "lin_2" || i["id"] == "lin_5"), "{put:?}");
+    assert!(board.frames().iter().all(|(m, _)| m == "pane.edit"), "{:?}", board.frames());
     // the next look asks only for what changed since
     let looks: Vec<Value> =
         fake.lock().unwrap().calls.iter().filter(|c| c.0 == "issues").map(|c| c.1.clone()).collect();
@@ -551,7 +563,7 @@ fn a_projects_board_has_its_issues_from_every_team() {
     fake.lock().unwrap().issues[0]["project"] = json!({"id": "proj-1"}); // ALA-1 is in Spark Voice too
     let node = node(&url, KEY, json!({}));
     let board = node.open_pane("board", json!({"project": "proj-1"})).unwrap();
-    let content = board.content();
+    let content = board.board();
     assert_eq!(content["project"], json!({"key": "SV", "title": "Spark Voice", "leading_tool": "linear"}));
     // ALA's states in its order, then OPS's own (Doing); a name both have is one column
     let states: Vec<&str> = content["states"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
@@ -560,14 +572,14 @@ fn a_projects_board_has_its_issues_from_every_team() {
     refs.sort();
     assert_eq!(refs, ["ALA-1", "OPS-6"]);
     // a move takes the issue's own team's state by that name
-    board.input(json!({"kind": "move", "item": "lin_6", "to": "Doing"})).unwrap();
+    board.input_json(json!({"kind": "move", "item": "lin_6", "to": "Doing"})).unwrap();
     let update = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
     assert_eq!(update.1, json!({"id": "lin_6", "input": {"stateId": "ops-Doing"}}));
     assert_eq!(board.item("lin_6").unwrap()["category"], "active");
-    board.input(json!({"kind": "move", "item": "lin_6", "to": "Done"})).unwrap();
+    board.input_json(json!({"kind": "move", "item": "lin_6", "to": "Done"})).unwrap();
     let update = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
     assert_eq!(update.1["input"], json!({"stateId": "ops-Done"}));
-    let refused = board.input(json!({"kind": "move", "item": "lin_1", "to": "Doing"})).unwrap_err();
+    let refused = board.input_json(json!({"kind": "move", "item": "lin_1", "to": "Doing"})).unwrap_err();
     assert_eq!(refused.message, "Doing isn't one of ALA's states");
     assert!(board.problems().is_empty(), "{:?}", board.problems());
 }
@@ -580,19 +592,19 @@ fn an_opened_card_gets_its_detail() {
     let node = node(&url, KEY, json!({}));
     let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
     assert!(board.item("lin_1").unwrap().get("body").is_none());
-    board.input(json!({"kind": "open", "item": "lin_1"})).unwrap();
+    board.input_json(json!({"kind": "open", "item": "lin_1"})).unwrap();
     let card = board.item("lin_1").unwrap();
     assert_eq!(card["body"], "Steps for 1");
     assert_eq!(card["children"], json!(["ALA-2"]));
     assert_eq!(card["comments"], json!([{"author": "ada", "body": "First!", "at": "2026-10-09T01:00:00.000Z"}]));
     // only the detail went out
     let (method, last) = board.frames().pop().unwrap();
-    assert_eq!(method, "pane.patch");
-    let mut paths: Vec<&str> = last["patch"].as_array().unwrap().iter().map(|o| o["path"].as_str().unwrap()).collect();
-    paths.sort();
-    assert_eq!(paths, ["/i/lin_1/body", "/i/lin_1/children", "/i/lin_1/comments"]);
+    assert_eq!(method, "pane.edit");
+    let put = put_items(&last);
+    assert_eq!(put.iter().map(|i| i["id"].as_str().unwrap()).collect::<Vec<_>>(), ["lin_1"]);
+    assert_eq!(put[0]["body"], "Steps for 1");
     // the board's people and labels, for the card's pickers
-    let groups = &board.content()["groups"];
+    let groups = &board.board()["groups"];
     let handles: Vec<&str> =
         groups["people"].as_array().unwrap().iter().map(|p| p["handle"].as_str().unwrap()).collect();
     assert_eq!(handles, ["ada", "james"]);
@@ -607,9 +619,9 @@ fn every_field_of_a_card_goes_to_linear() {
     let (url, fake) = linear();
     let node = node(&url, KEY, json!({}));
     let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
-    board.input(json!({"kind": "open", "item": "lin_1"})).unwrap();
+    board.input_json(json!({"kind": "open", "item": "lin_1"})).unwrap();
     board
-        .input(json!({"kind": "edit", "item": "lin_1", "fields": {
+        .input_json(json!({"kind": "edit", "item": "lin_1", "fields": {
             "owner": "ada", "labels": ["Bug", "Feature"], "estimate": 3, "sprint": "Cycle 41", "parent": "ALA-3",
             "body": "Now with steps", "target": "2026-10-20", "priority": "urgent"}}))
         .unwrap();
@@ -628,11 +640,11 @@ fn every_field_of_a_card_goes_to_linear() {
     assert_eq!((card["body"].as_str(), card["priority"].as_str()), (Some("Now with steps"), Some("urgent")));
     // taken off again
     board
-        .input(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": null, "sprint": null, "parent": null}}))
+        .input_json(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": null, "sprint": null, "parent": null}}))
         .unwrap();
     let card = board.item("lin_1").unwrap();
     assert_eq!((&card["owner"], &card["sprint"], &card["parent"]), (&Value::Null, &Value::Null, &Value::Null));
-    let nobody = board.input(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": "nobody"}})).unwrap_err();
+    let nobody = board.input_json(json!({"kind": "edit", "item": "lin_1", "fields": {"owner": "nobody"}})).unwrap_err();
     assert_eq!(nobody.message, "nobody isn't one of ALA's people");
     assert!(board.problems().is_empty(), "{:?}", board.problems());
 }
@@ -642,7 +654,9 @@ fn a_new_card_and_a_comment_go_to_linear() {
     let (url, fake) = linear();
     let node = node(&url, KEY, json!({}));
     let board = node.open_pane("board", json!({"team": "ALA"})).unwrap();
-    board.input(json!({"kind": "create", "fields": {"title": "Fresh", "state": "In Review", "owner": "ada"}})).unwrap();
+    board
+        .input_json(json!({"kind": "create", "fields": {"title": "Fresh", "state": "In Review", "owner": "ada"}}))
+        .unwrap();
     let made = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueCreate").cloned().unwrap();
     assert_eq!(
         made.1["input"],
@@ -653,19 +667,19 @@ fn a_new_card_and_a_comment_go_to_linear() {
         (card["ref"].as_str(), card["state"].as_str(), card["owner"].as_str()),
         (Some("ALA-101"), Some("In Review"), Some("ada"))
     );
-    let untitled = board.input(json!({"kind": "create", "fields": {"state": "Todo"}})).unwrap_err();
+    let untitled = board.input_json(json!({"kind": "create", "fields": {"state": "Todo"}})).unwrap_err();
     assert_eq!(untitled.message, "a new card needs a title");
 
-    board.input(json!({"kind": "comment", "item": "lin_2", "body": "Looks good"})).unwrap();
+    board.input_json(json!({"kind": "comment", "item": "lin_2", "body": "Looks good"})).unwrap();
     let said = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "commentCreate").cloned().unwrap();
     assert_eq!(said.1["input"], json!({"issueId": "lin_2", "body": "Looks good"}));
     assert_eq!(board.item("lin_2").unwrap()["comments"][0]["body"], "Looks good");
-    let empty = board.input(json!({"kind": "comment", "item": "lin_2", "body": " "})).unwrap_err();
+    let empty = board.input_json(json!({"kind": "comment", "item": "lin_2", "body": " "})).unwrap_err();
     assert_eq!(empty.message, "a comment needs words");
 
     // on a project's board, a new card goes in the project, on the team it names
     let project = node.open_pane("board", json!({"project": "proj-1"})).unwrap();
-    project.input(json!({"kind": "create", "fields": {"title": "Ops work", "team": "OPS"}})).unwrap();
+    project.input_json(json!({"kind": "create", "fields": {"title": "Ops work", "team": "OPS"}})).unwrap();
     let made = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueCreate").cloned().unwrap();
     assert_eq!(made.1["input"], json!({"title": "Ops work", "teamId": "team-2", "projectId": "proj-1"}));
     assert_eq!(project.item("lin_102").unwrap()["ref"], "OPS-102");

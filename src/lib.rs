@@ -524,6 +524,15 @@ pub fn board(
         size += n;
         kept.push(it);
     }
+    // the kept ones oldest first, the order an issue never leaves: the apps order cards by rank, and a change
+    // goes as edits to its card only while the list keeps its order (a new issue comes last)
+    kept.sort_by(|a, b| {
+        a["created_at"]
+            .as_str()
+            .unwrap_or_default()
+            .cmp(b["created_at"].as_str().unwrap_or_default())
+            .then_with(|| a["id"].as_str().cmp(&b["id"].as_str()))
+    });
     let left = issues.len() - kept.len();
     if left > 0 {
         let s = if left == 1 { "" } else { "s" };
