@@ -5,7 +5,7 @@
 [extension]
 id = "linear"
 name = "Linear"
-version = "0.5.2"
+version = "0.5.3"
 publisher = "aurelio"
 summary = "A Linear team's or project's board in the apps, drawn by Pointman's own board, with full control: every change goes to Linear."
 node = ">=0.2.0"
