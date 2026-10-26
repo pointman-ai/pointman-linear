@@ -624,7 +624,7 @@ fn every_key_in_the_vault_has_its_boards() {
     // and the first's still do
     assert_eq!(node.open_pane("board", json!({"team": "ALA"})).unwrap().title().as_deref(), Some("Spark · Linear"));
     // one neither key sees says what each said
-    let e = node.open_pane("board", json!({"team": "NOPE"})).unwrap_err();
+    let Err(e) = node.open_pane("board", json!({"team": "NOPE"})) else { panic!("a team no key sees opened") };
     assert!(e.message.contains("linear.alai: ") && e.message.contains("linear.spacesheep: "), "{e}");
 
     // a board opened straight away, with no linear.boards before it, finds its key too
