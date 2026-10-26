@@ -12,6 +12,11 @@ use pointman_extension::testing::{PaneOptions, StandIn};
 use serde_json::{json, Value};
 
 const KEY: &str = "lin_api_0123456789abcdefghijklmnopqrstuvwxyzABCD";
+/// A second Linear workspace's key: it sees `second`'s team and project, and nothing of the first's. Made at
+/// run time, so no key-shaped text is in the source for secret scanners to stop.
+fn key2() -> String {
+    format!("lin_api_{}", "s".repeat(40))
+}
 const WAIT: Duration = Duration::from_secs(10);
 
 /// Linear, as far as the board needs it: the teams (people, labels), issues, issueUpdate, issueCreate
@@ -321,7 +326,7 @@ fn linear() -> (String, Arc<Mutex<Fake>>) {
 
 fn serve(stream: TcpStream, fake: &Mutex<Fake>) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let (mut length, mut authorized) = (0usize, false);
+    let (mut length, mut authorized, mut second_key) = (0usize, false, false);
     let mut line = String::new();
     loop {
         line.clear();
@@ -338,12 +343,15 @@ fn serve(stream: TcpStream, fake: &Mutex<Fake>) {
         }
         if lower.starts_with("authorization:") {
             authorized = l["authorization:".len()..].trim() == KEY;
+            second_key = l["authorization:".len()..].trim() == key2();
         }
     }
     let mut body = vec![0u8; length];
     reader.read_exact(&mut body).unwrap();
     let (code, answer) = if authorized {
         fake.lock().unwrap().answer(&serde_json::from_slice(&body).unwrap_or(Value::Null))
+    } else if second_key {
+        second(&serde_json::from_slice(&body).unwrap_or(Value::Null))
     } else {
         (401, json!({"message": "Authentication required"}))
     };
@@ -354,6 +362,46 @@ fn serve(stream: TcpStream, fake: &Mutex<Fake>) {
         "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
         text.len()
     );
+}
+
+/// A second Linear workspace, as its own key (KEY2) sees it: one team (SPA, Spacesheep), one project (GTM
+/// Launch) and one issue, and nothing of the first workspace's.
+fn second(body: &Value) -> (u16, Value) {
+    let query = body["query"].as_str().unwrap_or_default();
+    let vars = &body["variables"];
+    let word =
+        query.split(|c: char| !c.is_alphanumeric()).find(|w| ["teams", "projects", "project", "issues"].contains(w));
+    let spa = team("team-9", "SPA", "Spacesheep", states());
+    match word {
+        Some("teams") if vars["key"].is_null() => {
+            (200, json!({"data": {"teams": {"nodes": [{"id": "team-9", "key": "SPA", "name": "Spacesheep"}]}}}))
+        }
+        Some("teams") => {
+            let found: Vec<Value> = [spa].into_iter().filter(|t| t["key"] == vars["key"]).collect();
+            (200, json!({"data": {"teams": {"nodes": found}, "issueLabels": workspace_labels()}}))
+        }
+        Some("projects") => (
+            200,
+            json!({"data": {"projects": {"nodes": [{"id": "proj-9", "name": "GTM Launch"}],
+                                         "pageInfo": {"hasNextPage": false, "endCursor": null}}}}),
+        ),
+        Some("project") if vars["id"] == "proj-9" => (
+            200,
+            json!({"data": {"project": {"id": "proj-9", "name": "GTM Launch", "teams": {"nodes": [spa]}},
+                            "issueLabels": workspace_labels()}}),
+        ),
+        Some("issues") => {
+            let filter = &vars["filter"];
+            let mut spa_1 = issue(1, "Todo", 1.0);
+            spa_1["id"] = json!("spa_1");
+            spa_1["identifier"] = json!("SPA-1");
+            spa_1["team"] = json!({"id": "team-9"});
+            let mine = filter["team"]["key"]["eq"] == "SPA" || filter["project"]["id"]["eq"] == "proj-9";
+            let nodes = if mine { vec![spa_1] } else { vec![] };
+            (200, json!({"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}}}}))
+        }
+        _ => (200, json!({"errors": [{"message": "Entity not found"}]})),
+    }
 }
 
 /// The cards a pane.edit puts, as the extension sent them.
@@ -547,6 +595,53 @@ fn linear_boards_lists_what_a_project_can_connect() {
         .unwrap();
     let e = none.run("linear.boards", json!({})).unwrap_err();
     assert_eq!(e.message, "no Linear API key in the vault: add one with /linear add");
+}
+
+/// A key per Linear workspace in the vault (linear.alai, linear.spacesheep): linear.boards lists every key's
+/// teams and projects, and a board opens with whichever key sees it, its first by label or not.
+#[test]
+fn every_key_in_the_vault_has_its_boards() {
+    let (url, _fake) = linear();
+    let node = StandIn::new(env!("CARGO_MANIFEST_DIR"))
+        .binary(env!("CARGO_BIN_EXE_linear"))
+        .settings(json!({"api_url": url, "refresh_seconds": 1}))
+        .secret("linear.alai", format!("LINEAR_API_KEY={KEY}\n"))
+        .secret("linear.spacesheep", format!("LINEAR_API_KEY={}\n", key2()))
+        .start()
+        .unwrap();
+    let done = node.run("linear.boards", json!({})).unwrap();
+    let names: Vec<&str> =
+        done.result["targets"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Operations", "Spark", "Spark Voice", "Spacesheep", "GTM Launch"]);
+    assert_eq!(
+        done.result["text"],
+        "linear.alai: 2 Linear teams: Operations (OPS), Spark (ALA). 1 Linear project: Spark Voice.\n\
+         linear.spacesheep: 1 Linear team: Spacesheep (SPA). 1 Linear project: GTM Launch."
+    );
+    // the second key's team and project open, with its issues
+    let spa = node.open_pane("board", json!({"team": "SPA"})).unwrap();
+    assert_eq!(spa.title().as_deref(), Some("Spacesheep · Linear"));
+    assert!(spa.board().to_string().contains("SPA-1"), "{}", spa.board());
+    let gtm = node.open_pane("board", json!({"project": "proj-9"})).unwrap();
+    assert_eq!(gtm.title().as_deref(), Some("GTM Launch · Linear"));
+    // and the first's still do
+    assert_eq!(node.open_pane("board", json!({"team": "ALA"})).unwrap().title().as_deref(), Some("Spark · Linear"));
+    // one neither key sees says what each said
+    let Err(e) = node.open_pane("board", json!({"team": "NOPE"})) else { panic!("a team no key sees opened") };
+    assert!(e.message.contains("linear.alai: ") && e.message.contains("linear.spacesheep: "), "{e}");
+
+    // a board opened straight away, with no linear.boards before it, finds its key too
+    let fresh = StandIn::new(env!("CARGO_MANIFEST_DIR"))
+        .binary(env!("CARGO_BIN_EXE_linear"))
+        .settings(json!({"api_url": url}))
+        .secret("linear.alai", format!("LINEAR_API_KEY={KEY}\n"))
+        .secret("linear.spacesheep", format!("LINEAR_API_KEY={}\n", key2()))
+        .start()
+        .unwrap();
+    assert_eq!(
+        fresh.open_pane("board", json!({"team": "SPA"})).unwrap().title().as_deref(),
+        Some("Spacesheep · Linear")
+    );
 }
 
 #[test]

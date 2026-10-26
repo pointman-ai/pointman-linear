@@ -16,9 +16,10 @@ pointman add linear
 
 1. **Add a key:** `/linear add` in any thread opens a form for a personal API key from linear.app
    (Settings › Security & access › New API key). It's sealed into the vault as `linear.<label>` for every
-   node, and never posted. Pointman asks Linear as the key's owner.
+   node, and never posted. Pointman asks Linear as the key's owner. Add one per Linear workspace: each
+   board is asked with the key that sees its team or project.
 2. **Connect a board:** in a project's pane, **Add a project board** lists the Linear teams and open
-   projects the key sees (`/linear boards` lists them in a thread). Pick one, and the project opens its
+   projects every key sees (`/linear boards` lists them in a thread). Pick one, and the project opens its
    board.
 
 ## The board
