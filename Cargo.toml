@@ -1,6 +1,6 @@
 [package]
 name = "linear"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "Linear on Pointman's nodes: a team's board as a pane, drawn by the apps' own board."
 license = "MIT"

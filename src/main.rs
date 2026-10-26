@@ -2,7 +2,8 @@
 //! over stdin and stdout. The `board` pane is a Linear team's or project's board, drawn by the apps' own board,
 //! with full control of it: a move, a rank, an edit, a new card or a comment goes to Linear, and every open
 //! board asks Linear what changed every 30 seconds.
-//! `linear.boards` lists the teams and projects it can open, for the apps' Add a project board.
+//! `linear.boards` lists the teams and projects it can open, for the apps' Add a project board: every key's in the
+//! vault, one per Linear workspace, and a board is asked with the key that sees it.
 
 use std::collections::HashMap;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -32,14 +33,16 @@ const WHOLE_EVERY: Duration = Duration::from_secs(600);
 /// How many opened cards keep their detail on a board.
 const DETAILS_KEPT: usize = 20;
 
-/// The vault's Linear API key for this machine (`linear.<label>`, the first by label).
+/// The vault's Linear API keys for this machine (`linear.<label>`, by label): one per Linear workspace, and
+/// a board goes with the key that sees its team or project.
 #[derive(Default)]
 struct Vault {
     listed: Option<Instant>,
     names: Vec<String>,
     /// The list being asked for behind, None in it if the node couldn't say.
     asking: Option<Receiver<Option<Vec<String>>>>,
-    opened: Option<(Instant, String, Option<String>)>,
+    /// Each key opened, by its name in the vault, and when.
+    opened: HashMap<String, (Instant, Option<String>)>,
 }
 
 /// What's done about the vault's list, from its age, whether it's being asked for already and whether it
@@ -67,7 +70,8 @@ fn list(h: &Handle) -> Option<Vec<String>> {
 }
 
 impl Vault {
-    fn key(&mut self, h: &Handle) -> Option<String> {
+    /// The vault's linear.* names, by label, listed again as `relist` says.
+    fn names(&mut self, h: &Handle) -> Vec<String> {
         if let Some(asking) = &self.asking {
             match asking.try_recv() {
                 Ok(got) => {
@@ -95,21 +99,25 @@ impl Vault {
             }
             Relist::Kept => {}
         }
-        let name = self.names.first()?.clone();
-        if let Some((at, n, key)) = &self.opened {
-            if *n == name && at.elapsed() < OPEN_EVERY {
+        self.names.clone()
+    }
+
+    /// One of them's key, opened again after OPEN_EVERY.
+    fn key(&mut self, h: &Handle, name: &str) -> Option<String> {
+        if let Some((at, key)) = self.opened.get(name) {
+            if at.elapsed() < OPEN_EVERY {
                 return key.clone();
             }
         }
         let found = Regex::new(r"lin_api_[A-Za-z0-9]{40}").expect("compiles");
-        let key = match h.secret(&name) {
+        let key = match h.secret(name) {
             Ok(value) => found.find(&value).map(|m| m.as_str().to_string()),
             Err(e) => {
                 h.log(format!("couldn't open {name}: {e}"));
                 None
             }
         };
-        self.opened = Some((Instant::now(), name, key.clone()));
+        self.opened.insert(name.to_string(), (Instant::now(), key.clone()));
         key
     }
 }
@@ -117,6 +125,8 @@ impl Vault {
 /// One open board: which team or project, Linear's issues as last seen, and the opened cards' detail.
 struct Shown {
     scope: Scope,
+    /// The vault's key it's asked with (linear.<label>).
+    account: String,
     issues: HashMap<String, Value>,
     /// opened cards' body, comments and children, by issue id; `opened` has the latest last
     details: HashMap<String, Value>,
@@ -144,6 +154,9 @@ struct Boards {
     map: Tracker,
     vault: Mutex<Vault>,
     open: Mutex<HashMap<String, Shown>>,
+    /// Which of the vault's keys sees a target ("team:ALA", "project:<id>"), from linear.boards and the
+    /// boards opened, so a board's open asks that one first.
+    seen: Mutex<HashMap<String, String>>,
 }
 
 impl Boards {
@@ -151,11 +164,26 @@ impl Boards {
         self.open.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn linear(&self) -> anyhow::Result<Linear> {
+    fn seen(&self) -> MutexGuard<'_, HashMap<String, String>> {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The vault's Linear keys, by name (linear.<label>): none is an error that says how to add one.
+    fn accounts(&self) -> anyhow::Result<Vec<String>> {
+        let names = self.vault.lock().unwrap_or_else(|e| e.into_inner()).names(&self.h);
+        if names.is_empty() {
+            bail!("no Linear API key in the vault: add one with /linear add");
+        }
+        Ok(names)
+    }
+
+    /// Linear, asked with one of the vault's keys.
+    fn linear(&self, account: &str) -> anyhow::Result<Linear> {
         let settings = self.h.settings();
         let url = settings["api_url"].as_str().filter(|u| !u.is_empty()).unwrap_or("https://api.linear.app/graphql");
-        let key = self.vault.lock().unwrap_or_else(|e| e.into_inner()).key(&self.h);
-        let key = key.context("no Linear API key in the vault: add one with /linear add")?;
+        let key = self.vault.lock().unwrap_or_else(|e| e.into_inner()).key(&self.h, account);
+        let key = key
+            .with_context(|| format!("{account} isn't a Linear API key (lin_api_…): add it again with /linear add"))?;
         Ok(Linear::new(url, &key))
     }
 
@@ -168,31 +196,55 @@ impl Boards {
     fn opened(&self, p: &Pane) -> anyhow::Result<PaneOpenResponse> {
         let text = |v: &Value| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
         let started = Instant::now();
-        let linear = self.linear()?;
         let (team, project) = (text(&p.target()["team"]), text(&p.target()["project"]));
-        let filter = match (&team, &project) {
-            (Some(team), None) => team_filter(team),
-            (None, Some(project)) => project_filter(project),
+        let (filter, seen_as) = match (&team, &project) {
+            (Some(team), None) => (team_filter(team), format!("team:{team}")),
+            (None, Some(project)) => (project_filter(project), format!("project:{project}")),
             _ => bail!(
                 "which Linear team or project? Open the board with {{team: \"ALA\"}} or {{project: id}}: \
                         /linear boards lists them"
             ),
         };
-        // the team or project and its issues at once: the issues need only the target's filter
-        let (scope, issues) = std::thread::scope(|s| {
-            let scope = s.spawn(|| match (&team, &project) {
-                (Some(team), _) => linear.team(team),
-                (_, Some(project)) => linear.project(project),
-                _ => unreachable!("the target was checked above"),
+        // the key that saw it before first, then the rest by label: the first that sees it opens it
+        let mut accounts = self.accounts()?;
+        if let Some(known) = self.seen().get(&seen_as).cloned() {
+            if let Some(i) = accounts.iter().position(|a| *a == known) {
+                let known = accounts.remove(i);
+                accounts.insert(0, known);
+            }
+        }
+        let (mut got, mut refused) = (None, Vec::new());
+        for account in &accounts {
+            let tried = self.linear(account).and_then(|linear| {
+                // the team or project and its issues at once: the issues need only the target's filter
+                let (scope, issues) = std::thread::scope(|s| {
+                    let scope = s.spawn(|| match (&team, &project) {
+                        (Some(team), _) => linear.team(team),
+                        (_, Some(project)) => linear.project(project),
+                        _ => unreachable!("the target was checked above"),
+                    });
+                    let issues = s.spawn(|| linear.issues(&filter, None));
+                    (joined(scope), joined(issues))
+                });
+                Ok((scope?, by_id(issues?)))
             });
-            let issues = s.spawn(|| linear.issues(&filter, None));
-            (joined(scope), joined(issues))
-        });
-        let (scope, issues) = (scope?, by_id(issues?));
+            match tried {
+                Ok(found) => {
+                    got = Some((account.clone(), found));
+                    break;
+                }
+                Err(e) => refused.push(format!("{account}: {e:#}")),
+            }
+        }
+        let Some((account, (scope, issues))) = got else {
+            bail!("none of the vault's Linear keys opens it ({})", refused.join("; "));
+        };
+        self.seen().insert(seen_as, account.clone());
         self.h.log(format!("board {}: {} issues in {} ms", scope.name, issues.len(), started.elapsed().as_millis()));
         let title = format!("{} · Linear", scope.name);
         let shown = Shown {
             scope,
+            account,
             since: newest(&issues),
             issues,
             details: HashMap::new(),
@@ -227,12 +279,12 @@ impl Boards {
     fn input(&self, p: &Pane, event: &Value) -> anyhow::Result<()> {
         let kind = event["kind"].as_str().unwrap_or_default();
         let refuse = |why: String| -> anyhow::Result<()> { Err(Refused::new(why).into()) };
-        let (scope, issues) = {
+        let (scope, issues, account) = {
             let open = self.open();
             let Some(shown) = open.get(p.id()) else { return refuse("this board is closed".into()) };
-            (shown.scope.clone(), shown.issues.clone())
+            (shown.scope.clone(), shown.issues.clone(), shown.account.clone())
         };
-        let linear = match self.linear() {
+        let linear = match self.linear(&account) {
             Ok(l) => l,
             Err(e) => return refuse(format!("{e:#}")),
         };
@@ -362,10 +414,10 @@ impl Boards {
                 }
                 let whole = shown.whole.elapsed() >= WHOLE_EVERY;
                 let opened: Vec<String> = shown.opened.clone();
-                (shown.scope.clone(), if whole { None } else { shown.since.clone() }, opened)
+                (shown.scope.clone(), if whole { None } else { shown.since.clone() }, opened, shown.account.clone())
             };
-            let (scope, since, opened) = due;
-            let got = self.linear().and_then(|l| {
+            let (scope, since, opened, account) = due;
+            let got = self.linear(&account).and_then(|l| {
                 let issues = l.issues(&scope.filter, since.as_deref())?;
                 let scope = match (since.is_none(), &scope.project, scope.teams.first()) {
                     (false, _, _) => None,
@@ -427,8 +479,13 @@ fn joined<T>(h: std::thread::ScopedJoinHandle<'_, anyhow::Result<T>>) -> anyhow:
 
 fn main() -> anyhow::Result<()> {
     let mut ext = Extension::new()?;
-    let boards =
-        Arc::new(Boards { h: ext.handle(), map: Tracker::default(), vault: Mutex::default(), open: Mutex::default() });
+    let boards = Arc::new(Boards {
+        h: ext.handle(),
+        map: Tracker::default(),
+        vault: Mutex::default(),
+        open: Mutex::default(),
+        seen: Mutex::default(),
+    });
 
     // `/linear add` posted (an agent, an older app): the apps open the key's form for it
     ext.command("linear.add", |_: &Job| {
@@ -438,21 +495,52 @@ fn main() -> anyhow::Result<()> {
 
     // what a project can be connected to (Pointman's Project pane, MB-378; the board's `targets`): the
     // teams and the open Linear projects the key sees, each as the target the board opens by
+    // teams and projects the key sees, each as the target the board opens by: every key's, one per Linear
+    // workspace (a team two keys see is listed once, as the first's)
     let b = boards.clone();
     ext.command("linear.boards", move |_: &Job| {
-        let linear = b.linear()?;
-        let (teams, projects) = (linear.teams()?, linear.projects()?);
+        let accounts = b.accounts()?;
         let listed = |names: Vec<String>, what: &str| match names.len() {
             0 => format!("No Linear {what}s"),
             n => format!("{n} Linear {what}{}: {}", if n == 1 { "" } else { "s" }, names.join(", ")),
         };
-        let team_names = teams
-            .iter()
-            .map(|t| format!("{} ({})", t["name"].as_str().unwrap_or_default(), t["key"].as_str().unwrap_or_default()))
-            .collect();
-        let project_names = projects.iter().filter_map(|p| p["name"].as_str()).map(String::from).collect();
-        let text = format!("{}. {}.", listed(team_names, "team"), listed(project_names, "project"));
-        Ok(json!({"targets": targets(&teams, &projects), "text": text}))
+        let (mut all, mut lines, mut refused) = (Vec::<Value>::new(), Vec::new(), Vec::new());
+        for account in &accounts {
+            let got = b.linear(account).and_then(|linear| Ok((linear.teams()?, linear.projects()?)));
+            let (teams, projects) = match got {
+                Ok(got) => got,
+                Err(e) => {
+                    refused.push(format!("{account}: {e:#}"));
+                    continue;
+                }
+            };
+            let team_names = teams
+                .iter()
+                .map(|t| {
+                    format!("{} ({})", t["name"].as_str().unwrap_or_default(), t["key"].as_str().unwrap_or_default())
+                })
+                .collect();
+            let project_names = projects.iter().filter_map(|p| p["name"].as_str()).map(String::from).collect();
+            let text = format!("{}. {}.", listed(team_names, "team"), listed(project_names, "project"));
+            lines.push(if accounts.len() > 1 { format!("{account}: {text}") } else { text });
+            for t in targets(&teams, &projects) {
+                let seen_as = match (t["target"]["team"].as_str(), t["target"]["project"].as_str()) {
+                    (Some(team), _) => format!("team:{team}"),
+                    (_, Some(project)) => format!("project:{project}"),
+                    _ => continue,
+                };
+                if all.iter().any(|a| a["target"] == t["target"]) {
+                    continue;
+                }
+                b.seen().entry(seen_as).or_insert_with(|| account.clone());
+                all.push(t);
+            }
+        }
+        if lines.is_empty() {
+            bail!("Linear refused every key in the vault ({})", refused.join("; "));
+        }
+        lines.extend(refused.iter().map(|r| format!("Couldn't ask with {r}")));
+        Ok(json!({"targets": all, "text": lines.join("\n")}))
     });
 
     let b = boards.clone();
