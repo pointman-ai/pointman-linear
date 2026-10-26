@@ -213,7 +213,7 @@ impl Boards {
                 accounts.insert(0, known);
             }
         }
-        let (mut got, mut refused) = (None, Vec::new());
+        let (mut got, mut refused) = (None, Vec::<(String, anyhow::Error)>::new());
         for account in &accounts {
             let tried = self.linear(account).and_then(|linear| {
                 // the team or project and its issues at once: the issues need only the target's filter
@@ -233,11 +233,11 @@ impl Boards {
                     got = Some((account.clone(), found));
                     break;
                 }
-                Err(e) => refused.push(format!("{account}: {e:#}")),
+                Err(e) => refused.push((account.clone(), e)),
             }
         }
         let Some((account, (scope, issues))) = got else {
-            bail!("none of the vault's Linear keys opens it ({})", refused.join("; "));
+            return Err(refused_by(refused, "none of the vault's Linear keys opens it"));
         };
         self.seen().insert(seen_as, account.clone());
         self.h.log(format!("board {}: {} issues in {} ms", scope.name, issues.len(), started.elapsed().as_millis()));
@@ -462,6 +462,15 @@ impl Boards {
     }
 }
 
+/// Why nothing opened: one key's own error as it is, or each key's after `what`.
+fn refused_by(mut refused: Vec<(String, anyhow::Error)>, what: &str) -> anyhow::Error {
+    if refused.len() == 1 {
+        return refused.remove(0).1;
+    }
+    let each: Vec<String> = refused.iter().map(|(account, e)| format!("{account}: {e:#}")).collect();
+    anyhow::anyhow!("{what} ({})", each.join("; "))
+}
+
 /// A board's input as one JSON object, its kind beside its fields, as `input` reads it.
 fn gesture(event: &PaneInput) -> Value {
     let mut out = match event.json() {
@@ -504,13 +513,14 @@ fn main() -> anyhow::Result<()> {
             0 => format!("No Linear {what}s"),
             n => format!("{n} Linear {what}{}: {}", if n == 1 { "" } else { "s" }, names.join(", ")),
         };
-        let (mut all, mut lines, mut refused) = (Vec::<Value>::new(), Vec::new(), Vec::new());
+        let (mut all, mut lines, mut refused) =
+            (Vec::<Value>::new(), Vec::new(), Vec::<(String, anyhow::Error)>::new());
         for account in &accounts {
             let got = b.linear(account).and_then(|linear| Ok((linear.teams()?, linear.projects()?)));
             let (teams, projects) = match got {
                 Ok(got) => got,
                 Err(e) => {
-                    refused.push(format!("{account}: {e:#}"));
+                    refused.push((account.clone(), e));
                     continue;
                 }
             };
@@ -537,9 +547,9 @@ fn main() -> anyhow::Result<()> {
             }
         }
         if lines.is_empty() {
-            bail!("Linear refused every key in the vault ({})", refused.join("; "));
+            return Err(refused_by(refused, "Linear refused every key in the vault"));
         }
-        lines.extend(refused.iter().map(|r| format!("Couldn't ask with {r}")));
+        lines.extend(refused.iter().map(|(account, e)| format!("Couldn't ask with {account}: {e:#}")));
         Ok(json!({"targets": all, "text": lines.join("\n")}))
     });
 

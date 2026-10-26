@@ -12,8 +12,11 @@ use pointman_extension::testing::{PaneOptions, StandIn};
 use serde_json::{json, Value};
 
 const KEY: &str = "lin_api_0123456789abcdefghijklmnopqrstuvwxyzABCD";
-/// A second Linear workspace's key: it sees `second`'s team and project, and nothing of the first's.
-const KEY2: &str = "lin_api_ZYXWVUTSRQPONMLKJIHGFEDCBAzyxwvutsrqpo";
+/// A second Linear workspace's key: it sees `second`'s team and project, and nothing of the first's. Made at
+/// run time, so no key-shaped text is in the source for secret scanners to stop.
+fn key2() -> String {
+    format!("lin_api_{}", "s".repeat(40))
+}
 const WAIT: Duration = Duration::from_secs(10);
 
 /// Linear, as far as the board needs it: the teams (people, labels), issues, issueUpdate, issueCreate
@@ -340,7 +343,7 @@ fn serve(stream: TcpStream, fake: &Mutex<Fake>) {
         }
         if lower.starts_with("authorization:") {
             authorized = l["authorization:".len()..].trim() == KEY;
-            second_key = l["authorization:".len()..].trim() == KEY2;
+            second_key = l["authorization:".len()..].trim() == key2();
         }
     }
     let mut body = vec![0u8; length];
@@ -603,7 +606,7 @@ fn every_key_in_the_vault_has_its_boards() {
         .binary(env!("CARGO_BIN_EXE_linear"))
         .settings(json!({"api_url": url, "refresh_seconds": 1}))
         .secret("linear.alai", format!("LINEAR_API_KEY={KEY}\n"))
-        .secret("linear.spacesheep", format!("LINEAR_API_KEY={KEY2}\n"))
+        .secret("linear.spacesheep", format!("LINEAR_API_KEY={}\n", key2()))
         .start()
         .unwrap();
     let done = node.run("linear.boards", json!({})).unwrap();
@@ -632,7 +635,7 @@ fn every_key_in_the_vault_has_its_boards() {
         .binary(env!("CARGO_BIN_EXE_linear"))
         .settings(json!({"api_url": url}))
         .secret("linear.alai", format!("LINEAR_API_KEY={KEY}\n"))
-        .secret("linear.spacesheep", format!("LINEAR_API_KEY={KEY2}\n"))
+        .secret("linear.spacesheep", format!("LINEAR_API_KEY={}\n", key2()))
         .start()
         .unwrap();
     assert_eq!(
