@@ -442,7 +442,7 @@ checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
 
 [[package]]
 name = "linear"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "pointman-extension",
@@ -500,8 +500,8 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pointman-extension"
-version = "0.2.0"
-source = "git+https://github.com/pointman-ai/pointman-extension?rev=d338e27a5719139d7cafae4f838c1b699395710b#d338e27a5719139d7cafae4f838c1b699395710b"
+version = "0.5.0"
+source = "git+https://github.com/pointman-ai/pointman-extension?rev=b4b2f874595fac71d220bb920e96c6390678c5a2#b4b2f874595fac71d220bb920e96c6390678c5a2"
 dependencies = [
  "anyhow",
  "buffa",
