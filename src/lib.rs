@@ -253,7 +253,7 @@ impl Linear {
     pub fn team(&self, key: &str) -> anyhow::Result<Scope> {
         let data = self.gql(
             &format!(
-                "query($key: String!) {{ teams(filter: {{key: {{eq: $key}}}}) {{ nodes {{ {TEAM_FIELDS} }} }} \
+                "query($key: String!) {{ teams(first: 1, filter: {{key: {{eq: $key}}}}) {{ nodes {{ {TEAM_FIELDS} }} }} \
                    {WORKSPACE_LABELS} }}"
             ),
             json!({"key": key}),
