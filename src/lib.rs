@@ -352,7 +352,7 @@ impl Linear {
     pub fn update(&self, id: &str, input: Value) -> anyhow::Result<Value> {
         let query = format!(
             "mutation($id: String!, $input: IssueUpdateInput!) {{ issueUpdate(id: $id, input: $input) {{ \
-               success issue {{ {ISSUE_FIELDS} }} }} }}"
+               success issue {{ {ISSUE_FIELDS} team {{ id key }} project {{ id name }} }} }} }}"
         );
         let done = &self.gql(&query, json!({"id": id, "input": input}))?["issueUpdate"];
         if done["success"] != true {
@@ -364,7 +364,7 @@ impl Linear {
     /// issueCreate: the new issue as Linear has it.
     pub fn create(&self, input: Value) -> anyhow::Result<Value> {
         let query = format!(
-            "mutation($input: IssueCreateInput!) {{ issueCreate(input: $input) {{ success issue {{ {ISSUE_FIELDS} }} }} }}"
+            "mutation($input: IssueCreateInput!) {{ issueCreate(input: $input) {{ success issue {{ {ISSUE_FIELDS} team {{ id key }} project {{ id name }} }} }} }}"
         );
         let done = &self.gql(&query, json!({"input": input}))?["issueCreate"];
         if done["success"] != true {
