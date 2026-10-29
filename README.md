@@ -62,6 +62,17 @@ move sets the issue's own team's state of that name.
 |---|---|---|
 | `linear.add` | `/linear add` | Add a Linear API key for every node |
 | `linear.boards` | `/linear boards` | The Linear teams and open projects whose boards can be connected |
+| `linear.team` | | A team's states, people, labels and sprints: what an issue on it can be set to. `team` |
+| `linear.projects` | | The open Linear projects the keys see |
+| `linear.search` | | Issues by `query` (words in the title or description), `team`, `state`, `owner` (a display name, or `none`) or `project`; open ones unless `all`; at most `limit` (25) |
+| `linear.issue` | | One issue by its ref (`ALA-12`), with its description, comments and sub-issues |
+| `linear.create` | | A new issue: `team`, `title`, and any of `body`, `state`, `owner`, `priority`, `target`, `estimate`, `labels`, `sprint`, `parent`, `project` |
+| `linear.update` | | Change an issue by its ref: the same fields; only those given change, and null clears one |
+| `linear.comment` | | A comment on an issue: `issue`, `body` |
+
+The last seven are for agents and scripts (`create_job`): each asks with the vault's keys in turn, or the one
+`account` names (`work`, for `linear.work`), so an issue or team is found with whichever key sees it. A state, owner,
+label, sprint or parent that the team doesn't have is refused with what it does have, as on the board.
 
 `linear.boards` answers with each one's target, name, suggested project key and kind:
 

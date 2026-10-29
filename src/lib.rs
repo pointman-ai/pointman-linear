@@ -391,6 +391,97 @@ impl Linear {
             self.gql(&format!("query($id: String!) {{ issue(id: $id) {{ {DETAIL_FIELDS} }} }}"), json!({"id": id}))?;
         Ok(detail_of(&data["issue"]))
     }
+
+    /// One issue by its ref (ALA-12) or id, with its description, comments and sub-issues, or why there isn't one.
+    pub fn find(&self, id: &str) -> anyhow::Result<Value> {
+        let data = self.gql(
+            &format!(
+                "query($id: String!) {{ issue(id: $id) {{ {ISSUE_FIELDS} team {{ id key }} \
+                   project {{ id name }} {DETAIL_FIELDS} }} }}"
+            ),
+            json!({"id": id}),
+        )?;
+        match data["issue"].is_object() {
+            true => Ok(data["issue"].clone()),
+            false => bail!("Linear has no issue {id} for this key"),
+        }
+    }
+
+    /// Issues matching a filter, the latest changed first, at most `limit`.
+    pub fn search(&self, filter: &Value, limit: usize) -> anyhow::Result<Vec<Value>> {
+        let data = self.gql(
+            &format!(
+                "query($filter: IssueFilter, $first: Int) {{ issues(filter: $filter, first: $first, \
+                   orderBy: updatedAt) {{ nodes {{ {ISSUE_FIELDS} team {{ id key }} project {{ id name }} }} }} }}"
+            ),
+            json!({"filter": filter, "first": limit.clamp(1, 100)}),
+        )?;
+        Ok(nodes(&data["issues"]))
+    }
+}
+
+/// Linear's IssueFilter for a search: words in the title or description, a team (its key), a state (its
+/// name), an owner (a display name, or `none`) and a project (its name, or its id as a UUID). Open issues only, unless `all`.
+pub fn search_filter(
+    words: Option<&str>,
+    team: Option<&str>,
+    state: Option<&str>,
+    owner: Option<&str>,
+    project: Option<&str>,
+    all: bool,
+) -> Value {
+    let mut filter = Map::new();
+    if let Some(words) = words.map(str::trim).filter(|w| !w.is_empty()) {
+        filter.insert(
+            "or".into(),
+            json!([{"title": {"containsIgnoreCase": words}}, {"description": {"containsIgnoreCase": words}}]),
+        );
+    }
+    if let Some(team) = team {
+        filter.insert("team".into(), json!({"key": {"eqIgnoreCase": team}}));
+    }
+    if let Some(state) = state {
+        filter.insert("state".into(), json!({"name": {"eqIgnoreCase": state}}));
+    } else if !all {
+        filter.insert("state".into(), json!({"type": {"nin": ["completed", "canceled"]}}));
+    }
+    if let Some(owner) = owner {
+        let who = if owner == "none" { json!({"null": true}) } else { json!({"displayName": {"eqIgnoreCase": owner}}) };
+        filter.insert("assignee".into(), who);
+    }
+    if let Some(project) = project {
+        // Linear checks an id filter's value is a UUID, so the shape of what's given says which it is
+        let uuid = Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+            .expect("compiles");
+        let by = if uuid.is_match(project) {
+            json!({"id": {"eq": project}})
+        } else {
+            json!({"name": {"eqIgnoreCase": project}})
+        };
+        filter.insert("project".into(), by);
+    }
+    Value::Object(filter)
+}
+
+/// An issue as an agent reads it: the board's item with its team and project, and its detail when it has it.
+pub fn issue_out(map: &Tracker, issue: &Value) -> Value {
+    let detail = issue["description"].is_string().then(|| detail_of(issue));
+    let mut out = item(map, issue, detail.as_ref());
+    out["team"] = issue["team"]["key"].clone();
+    out["project"] = issue["project"]["name"].clone();
+    out
+}
+
+/// Issues as a line each, for the text beside them.
+pub fn issue_lines(issues: &[Value]) -> String {
+    if issues.is_empty() {
+        return "No issues".into();
+    }
+    let line = |i: &Value| {
+        let (state, owner) = (i["state"].as_str().unwrap_or("?"), i["owner"].as_str().unwrap_or("nobody"));
+        format!("{} {} [{state}, {owner}]", i["ref"].as_str().unwrap_or("?"), i["title"].as_str().unwrap_or_default())
+    };
+    issues.iter().map(line).collect::<Vec<_>>().join("\n")
 }
 
 // ------------------------------------------------------------------ the board
@@ -423,7 +514,7 @@ pub fn item(map: &Tracker, issue: &Value, detail: Option<&Value>) -> Value {
 }
 
 /// A Linear user as a board's handle: their display name.
-fn handle(user: &Value) -> Value {
+pub fn handle(user: &Value) -> Value {
     user["displayName"].as_str().or(user["name"].as_str()).map_or(Value::Null, |h| json!(h))
 }
 
@@ -918,6 +1009,19 @@ mod tests {
         assert_eq!(refused(json!({"title": ""})), "a title can't be empty");
         assert_eq!(refused(json!({"color": "red"})), "color isn't something a Linear card has here");
         assert_eq!(refused(json!({})), "nothing to change");
+    }
+
+    #[test]
+    fn a_search_filters_a_project_by_the_shape_of_what_it_is_given() {
+        let by = |p| search_filter(None, None, None, None, Some(p), false)["project"].clone();
+        assert_eq!(by("Spark Voice"), json!({"name": {"eqIgnoreCase": "Spark Voice"}}));
+        let id = "2b6f1c0e-8d3a-4c1f-9a7e-5d4b3c2a1f00";
+        assert_eq!(by(id), json!({"id": {"eq": id}}));
+        let f = search_filter(Some("login"), Some("ala"), None, Some("none"), None, false);
+        assert_eq!(f["assignee"], json!({"null": true}));
+        assert_eq!(f["state"], json!({"type": {"nin": ["completed", "canceled"]}}));
+        assert_eq!(f["team"], json!({"key": {"eqIgnoreCase": "ala"}}));
+        assert!(search_filter(None, None, None, None, None, true).get("state").is_none(), "all includes closed ones");
     }
 
     #[test]
