@@ -5,7 +5,7 @@
 [extension]
 id = "linear"
 name = "Linear"
-version = "0.7.0"
+version = "0.7.1"
 publisher = "aurelio"
 summary = "A Linear team's or project's board in the apps, drawn by Pointman's own board, with full control: every change goes to Linear."
 node = ">=0.4.0"
@@ -68,43 +68,43 @@ summary = "The Linear teams and projects whose boards can be connected"
 [[commands]]
 kind = "linear.team"
 title = "A team's states, people, labels and sprints"
-params = { type = "object", required = ["team"], properties = { team = { type = "string", description = "The team's key (ALA)" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
+params = { type = "object", required = ["team"], properties = { thread_id = { type = "integer", description = "Set by the board: the thread the answer is posted in" }, team = { type = "string", description = "The team's key (ALA)" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
 summary = "What an issue on a team can be set to"
 
 [[commands]]
 kind = "linear.projects"
 title = "List Linear projects"
-params = { type = "object", properties = { account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
+params = { type = "object", properties = { thread_id = { type = "integer", description = "Set by the board: the thread the answer is posted in" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
 summary = "The open Linear projects the keys see"
 
 [[commands]]
 kind = "linear.search"
 title = "Search issues"
-params = { type = "object", properties = { query = { type = "string", description = "Words in the title or description" }, team = { type = "string", description = "The team's key" }, state = { type = "string" }, owner = { type = "string", description = "A display name, or none" }, project = { type = "string", description = "A project's name or id" }, all = { type = "boolean", description = "Include completed and canceled issues" }, limit = { type = "integer", minimum = 1, maximum = 100, default = 25 }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
+params = { type = "object", properties = { thread_id = { type = "integer", description = "Set by the board: the thread the answer is posted in" }, query = { type = "string", description = "Words in the title or description" }, team = { type = "string", description = "The team's key" }, state = { type = "string" }, owner = { type = "string", description = "A display name, or none" }, project = { type = "string", description = "A project's name or id" }, all = { type = "boolean", description = "Include completed and canceled issues" }, limit = { type = "integer", minimum = 1, maximum = 100, default = 25 }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
 summary = "Issues by words, team, state, owner or project; open ones unless all"
 
 [[commands]]
 kind = "linear.issue"
 title = "Read an issue"
-params = { type = "object", required = ["issue"], properties = { issue = { type = "string", description = "Its ref (ALA-12)" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
+params = { type = "object", required = ["issue"], properties = { thread_id = { type = "integer", description = "Set by the board: the thread the answer is posted in" }, issue = { type = "string", description = "Its ref (ALA-12)" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
 summary = "An issue with its description, comments and sub-issues"
 
 [[commands]]
 kind = "linear.create"
 title = "File an issue"
-params = { type = "object", required = ["team", "title"], properties = { team = { type = "string", description = "The team's key (ALA)" }, project = { type = "string", description = "A project's name or id" }, title = { type = "string" }, body = { type = "string", description = "Markdown" }, state = { type = "string", description = "One of the team's states (linear.team lists them)" }, owner = { type = ["string", "null"], description = "A person's display name (linear.team lists them); null clears it" }, priority = { type = "string", enum = ["urgent", "high", "normal", "low", "none"] }, target = { type = ["string", "null"], description = "Due date, YYYY-MM-DD; null clears it" }, estimate = { type = ["integer", "null"] }, labels = { type = "array", items = { type = "string" }, description = "Label names; replaces the issue's labels" }, sprint = { type = ["string", "null"], description = "A cycle's id, name or Cycle N; null clears it" }, parent = { type = ["string", "null"], description = "The parent issue's ref (ALA-12); null clears it" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
+params = { type = "object", required = ["team", "title"], properties = { thread_id = { type = "integer", description = "Set by the board: the thread the answer is posted in" }, team = { type = "string", description = "The team's key (ALA)" }, project = { type = "string", description = "A project's name or id" }, title = { type = "string" }, body = { type = "string", description = "Markdown" }, state = { type = "string", description = "One of the team's states (linear.team lists them)" }, owner = { type = ["string", "null"], description = "A person's display name (linear.team lists them); null clears it" }, priority = { type = "string", enum = ["urgent", "high", "normal", "low", "none"] }, target = { type = ["string", "null"], description = "Due date, YYYY-MM-DD; null clears it" }, estimate = { type = ["integer", "null"] }, labels = { type = "array", items = { type = "string" }, description = "Label names; replaces the issue's labels" }, sprint = { type = ["string", "null"], description = "A cycle's id, name or Cycle N; null clears it" }, parent = { type = ["string", "null"], description = "The parent issue's ref (ALA-12); null clears it" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
 summary = "A new issue on a team"
 
 [[commands]]
 kind = "linear.update"
 title = "Change an issue"
-params = { type = "object", required = ["issue"], properties = { issue = { type = "string", description = "Its ref (ALA-12)" }, title = { type = "string" }, body = { type = "string", description = "Markdown" }, state = { type = "string", description = "One of the team's states (linear.team lists them)" }, owner = { type = ["string", "null"], description = "A person's display name (linear.team lists them); null clears it" }, priority = { type = "string", enum = ["urgent", "high", "normal", "low", "none"] }, target = { type = ["string", "null"], description = "Due date, YYYY-MM-DD; null clears it" }, estimate = { type = ["integer", "null"] }, labels = { type = "array", items = { type = "string" }, description = "Label names; replaces the issue's labels" }, sprint = { type = ["string", "null"], description = "A cycle's id, name or Cycle N; null clears it" }, parent = { type = ["string", "null"], description = "The parent issue's ref (ALA-12); null clears it" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
+params = { type = "object", required = ["issue"], properties = { thread_id = { type = "integer", description = "Set by the board: the thread the answer is posted in" }, issue = { type = "string", description = "Its ref (ALA-12)" }, title = { type = "string" }, body = { type = "string", description = "Markdown" }, state = { type = "string", description = "One of the team's states (linear.team lists them)" }, owner = { type = ["string", "null"], description = "A person's display name (linear.team lists them); null clears it" }, priority = { type = "string", enum = ["urgent", "high", "normal", "low", "none"] }, target = { type = ["string", "null"], description = "Due date, YYYY-MM-DD; null clears it" }, estimate = { type = ["integer", "null"] }, labels = { type = "array", items = { type = "string" }, description = "Label names; replaces the issue's labels" }, sprint = { type = ["string", "null"], description = "A cycle's id, name or Cycle N; null clears it" }, parent = { type = ["string", "null"], description = "The parent issue's ref (ALA-12); null clears it" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
 summary = "Change an issue's fields; only those given change"
 
 [[commands]]
 kind = "linear.comment"
 title = "Comment on an issue"
-params = { type = "object", required = ["issue", "body"], properties = { issue = { type = "string", description = "Its ref (ALA-12)" }, body = { type = "string", description = "Markdown" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
+params = { type = "object", required = ["issue", "body"], properties = { thread_id = { type = "integer", description = "Set by the board: the thread the answer is posted in" }, issue = { type = "string", description = "Its ref (ALA-12)" }, body = { type = "string", description = "Markdown" }, account = { type = "string", description = "Which vault key to use (work, for linear.work); by default each key is tried" } }, additionalProperties = false }
 summary = "A comment on an issue"
 
 # a team's or a Linear project's board (Pointman's docs/dev/panes.md, "Boards"): opened with {team: key}
