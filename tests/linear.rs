@@ -155,7 +155,12 @@ impl Fake {
                 let team = filter["team"]["key"]["eq"].as_str().or(filter["team"]["key"]["eqIgnoreCase"].as_str());
                 let words = filter["or"][0]["title"]["containsIgnoreCase"].as_str();
                 let closed = filter["state"]["type"]["nin"].as_array().is_some();
-                let project = &filter["project"]["id"]["eq"];
+                let named = filter["project"]["name"]["eqIgnoreCase"].as_str().map(str::to_lowercase);
+                let project = match named.as_deref() {
+                    Some("spark voice") => json!("proj-1"),
+                    Some(_) => json!("proj-none"),
+                    None => filter["project"]["id"]["eq"].clone(),
+                };
                 let team_of = |i: &Value| if i["team"]["id"] == "team-2" { "OPS" } else { "ALA" };
                 let nodes: Vec<Value> = self
                     .issues
@@ -164,7 +169,7 @@ impl Fake {
                     .filter(|i| team.is_none_or(|t| team_of(i).eq_ignore_ascii_case(t)))
                     .filter(|i| words.is_none_or(|w| i["title"].as_str().unwrap().contains(w)))
                     .filter(|i| !closed || !["completed", "canceled"].contains(&i["state"]["type"].as_str().unwrap()))
-                    .filter(|i| project.is_null() || i["project"]["id"] == *project)
+                    .filter(|i| project.is_null() || i["project"]["id"] == project)
                     .cloned()
                     .collect();
                 (
@@ -373,8 +378,9 @@ fn serve(stream: TcpStream, fake: &Mutex<Fake>) {
 fn second(body: &Value) -> (u16, Value) {
     let query = body["query"].as_str().unwrap_or_default();
     let vars = &body["variables"];
-    let word =
-        query.split(|c: char| !c.is_alphanumeric()).find(|w| ["teams", "projects", "project", "issues"].contains(w));
+    let word = query
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|w| ["teams", "projects", "project", "issues", "issue"].contains(w));
     let spa = team("team-9", "SPA", "Spacesheep", states());
     match word {
         Some("teams") if vars["key"].is_null() => {
@@ -394,13 +400,24 @@ fn second(body: &Value) -> (u16, Value) {
             json!({"data": {"project": {"id": "proj-9", "name": "GTM Launch", "teams": {"nodes": [spa]}},
                             "issueLabels": workspace_labels()}}),
         ),
+        Some("issue") if vars["id"] == "SPA-1" => {
+            let mut spa_1 = issue(1, "Todo", 1.0);
+            spa_1["id"] = json!("spa_1");
+            spa_1["identifier"] = json!("SPA-1");
+            spa_1["team"] = json!({"id": "team-9", "key": "SPA"});
+            spa_1["children"] = json!({"nodes": []});
+            spa_1["comments"] = json!({"nodes": []});
+            (200, json!({"data": {"issue": spa_1}}))
+        }
         Some("issues") => {
             let filter = &vars["filter"];
             let mut spa_1 = issue(1, "Todo", 1.0);
             spa_1["id"] = json!("spa_1");
             spa_1["identifier"] = json!("SPA-1");
             spa_1["team"] = json!({"id": "team-9"});
-            let mine = filter["team"]["key"]["eq"] == "SPA" || filter["project"]["id"]["eq"] == "proj-9";
+            let mine = filter["team"]["key"]["eq"] == "SPA"
+                || filter["team"]["key"]["eqIgnoreCase"] == "SPA"
+                || filter["project"]["id"]["eq"] == "proj-9";
             let nodes = if mine { vec![spa_1] } else { vec![] };
             (200, json!({"data": {"issues": {"nodes": nodes, "pageInfo": {"hasNextPage": false, "endCursor": null}}}}))
         }
@@ -814,6 +831,8 @@ fn an_agent_looks_up_searches_reads_files_changes_and_comments() {
     assert!(open["text"].as_str().unwrap().starts_with("ALA-3 Issue 3 [In Review, james]"));
     let all = node.run("linear.search", json!({"team": "ALA", "all": true, "limit": 2})).unwrap().result;
     assert_eq!(refs(&all), ["ALA-4", "ALA-3"]);
+    let by_project = node.run("linear.search", json!({"project": "spark voice"})).unwrap().result;
+    assert_eq!(refs(&by_project), ["OPS-6"]);
     let words = node.run("linear.search", json!({"query": "Issue 2"})).unwrap().result;
     assert_eq!(refs(&words), ["ALA-2"]);
     assert_eq!(node.run("linear.search", json!({"query": "nothing like it"})).unwrap().result["text"], "No issues");
@@ -894,4 +913,37 @@ fn an_agent_can_name_the_key_and_with_none_is_told_how_to_add_one() {
         .unwrap();
     let e = none.run("linear.create", json!({"team": "ALA", "title": "x"})).unwrap_err();
     assert_eq!(e.message, "no Linear API key in the vault: add one with /linear add");
+}
+
+/// With a key per workspace, a team or an issue is found with whichever key sees it; when none does, every
+/// key's reason is given.
+#[test]
+fn an_issue_is_found_with_whichever_key_sees_it() {
+    let (url, _fake) = linear();
+    let node = StandIn::new(env!("CARGO_MANIFEST_DIR"))
+        .binary(env!("CARGO_BIN_EXE_linear"))
+        .settings(json!({"api_url": url}))
+        .secret("linear.alai", format!("LINEAR_API_KEY={KEY}\n"))
+        .secret("linear.spacesheep", format!("LINEAR_API_KEY={}\n", key2()))
+        .start()
+        .unwrap();
+    // the first key can't see SPA-1; the second can
+    let read = node.run("linear.issue", json!({"issue": "SPA-1"})).unwrap().result;
+    assert_eq!((read["issue"]["ref"].as_str(), read["issue"]["team"].as_str()), (Some("SPA-1"), Some("SPA")));
+    assert_eq!(node.run("linear.issue", json!({"issue": "ALA-2"})).unwrap().result["issue"]["ref"], "ALA-2");
+    assert_eq!(node.run("linear.team", json!({"team": "SPA"})).unwrap().result["name"], "Spacesheep");
+    // naming the key that can't see it says so
+    let e = node.run("linear.issue", json!({"issue": "SPA-1", "account": "alai"})).unwrap_err();
+    assert!(e.message.contains("Entity not found"), "{}", e.message);
+    // one neither sees says what each said
+    let e = node.run("linear.issue", json!({"issue": "ZZZ-1"})).unwrap_err();
+    assert!(e.message.contains("linear.alai: ") && e.message.contains("linear.spacesheep: "), "{}", e.message);
+    // searching asks every key and merges
+    let found = node.run("linear.search", json!({"team": "SPA"})).unwrap().result;
+    assert_eq!(found["issues"][0]["ref"], "SPA-1");
+    // a write goes with the key that found the issue
+    let projects = node.run("linear.projects", json!({})).unwrap().result;
+    let names: Vec<&str> =
+        projects["projects"].as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Spark Voice", "GTM Launch"]);
 }

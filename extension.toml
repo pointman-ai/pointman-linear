@@ -15,6 +15,9 @@ platforms = ["macos-arm64", "macos-x86_64", "linux-x86_64", "linux-arm64"]
 command = ["bin/linear"]
 runtime = "binary"
 
+[behavior]
+skill = "SKILLS.md"
+
 [permissions]
 network = true
 secrets = ["linear.*"]           # each workspace's API key, kept in the vault as linear.<label>

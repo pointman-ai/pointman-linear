@@ -421,7 +421,7 @@ impl Linear {
 }
 
 /// Linear's IssueFilter for a search: words in the title or description, a team (its key), a state (its
-/// name), an owner (a display name, or `none`) and a project (its name or id). Open issues only, unless `all`.
+/// name), an owner (a display name, or `none`) and a project (its name, or its id as a UUID). Open issues only, unless `all`.
 pub fn search_filter(
     words: Option<&str>,
     team: Option<&str>,
@@ -450,7 +450,15 @@ pub fn search_filter(
         filter.insert("assignee".into(), who);
     }
     if let Some(project) = project {
-        filter.insert("project".into(), json!({"or": [{"id": {"eq": project}}, {"name": {"eqIgnoreCase": project}}]}));
+        // Linear checks an id filter's value is a UUID, so the shape of what's given says which it is
+        let uuid = Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+            .expect("compiles");
+        let by = if uuid.is_match(project) {
+            json!({"id": {"eq": project}})
+        } else {
+            json!({"name": {"eqIgnoreCase": project}})
+        };
+        filter.insert("project".into(), by);
     }
     Value::Object(filter)
 }
@@ -1001,6 +1009,19 @@ mod tests {
         assert_eq!(refused(json!({"title": ""})), "a title can't be empty");
         assert_eq!(refused(json!({"color": "red"})), "color isn't something a Linear card has here");
         assert_eq!(refused(json!({})), "nothing to change");
+    }
+
+    #[test]
+    fn a_search_filters_a_project_by_the_shape_of_what_it_is_given() {
+        let by = |p| search_filter(None, None, None, None, Some(p), false)["project"].clone();
+        assert_eq!(by("Spark Voice"), json!({"name": {"eqIgnoreCase": "Spark Voice"}}));
+        let id = "2b6f1c0e-8d3a-4c1f-9a7e-5d4b3c2a1f00";
+        assert_eq!(by(id), json!({"id": {"eq": id}}));
+        let f = search_filter(Some("login"), Some("ala"), None, Some("none"), None, false);
+        assert_eq!(f["assignee"], json!({"null": true}));
+        assert_eq!(f["state"], json!({"type": {"nin": ["completed", "canceled"]}}));
+        assert_eq!(f["team"], json!({"key": {"eqIgnoreCase": "ala"}}));
+        assert!(search_filter(None, None, None, None, None, true).get("state").is_none(), "all includes closed ones");
     }
 
     #[test]
