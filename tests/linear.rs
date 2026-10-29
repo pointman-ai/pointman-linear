@@ -90,7 +90,7 @@ fn issue(n: u32, state_name: &str, order: f64) -> Value {
     json!({"id": format!("lin_{n}"), "identifier": format!("ALA-{n}"), "title": format!("Issue {n}"), "priority": 3,
            "dueDate": null, "url": format!("https://linear.app/alai/issue/ALA-{n}"),
            "updatedAt": format!("2026-10-08T10:00:{n:02}.000Z"), "sortOrder": order,
-           "team": {"id": "team-1"}, "state": {"id": st["id"], "name": st["name"], "type": st["type"]},
+           "team": {"id": "team-1", "key": "ALA"}, "state": {"id": st["id"], "name": st["name"], "type": st["type"]},
            "assignee": {"id": "u1", "name": "James Briggs", "displayName": "james"}, "labels": {"nodes": []},
            "estimate": null, "createdAt": "2026-10-01T00:00:00.000Z", "description": format!("Steps for {n}"),
            "parent": null, "cycle": null, "projectMilestone": null, "project": null})
@@ -101,7 +101,7 @@ fn ops_issue(n: u32, state_name: &str) -> Value {
     let st = ops_states().into_iter().find(|s| s["name"] == state_name).unwrap();
     let mut i = issue(n, "Todo", 1.0);
     i["identifier"] = json!(format!("OPS-{n}"));
-    i["team"] = json!({"id": "team-2"});
+    i["team"] = json!({"id": "team-2", "key": "OPS"});
     i["state"] = json!({"id": st["id"], "name": st["name"], "type": st["type"]});
     i["project"] = json!({"id": "proj-1"});
     i
@@ -152,14 +152,18 @@ impl Fake {
             Some("issues") => {
                 let filter = &vars["filter"];
                 let since = filter["updatedAt"]["gt"].as_str();
-                let team = filter["team"]["key"]["eq"].as_str();
+                let team = filter["team"]["key"]["eq"].as_str().or(filter["team"]["key"]["eqIgnoreCase"].as_str());
+                let words = filter["or"][0]["title"]["containsIgnoreCase"].as_str();
+                let closed = filter["state"]["type"]["nin"].as_array().is_some();
                 let project = &filter["project"]["id"]["eq"];
                 let team_of = |i: &Value| if i["team"]["id"] == "team-2" { "OPS" } else { "ALA" };
                 let nodes: Vec<Value> = self
                     .issues
                     .iter()
                     .filter(|i| since.is_none_or(|s| i["updatedAt"].as_str().unwrap() > s))
-                    .filter(|i| team.is_none_or(|t| team_of(i) == t))
+                    .filter(|i| team.is_none_or(|t| team_of(i).eq_ignore_ascii_case(t)))
+                    .filter(|i| words.is_none_or(|w| i["title"].as_str().unwrap().contains(w)))
+                    .filter(|i| !closed || !["completed", "canceled"].contains(&i["state"]["type"].as_str().unwrap()))
                     .filter(|i| project.is_null() || i["project"]["id"] == *project)
                     .cloned()
                     .collect();
@@ -203,7 +207,7 @@ impl Fake {
                 let n = 100 + self.clock;
                 let mut it = issue(n, "Todo", 0.0);
                 if input["teamId"] == "team-2" {
-                    it["team"] = json!({"id": "team-2"});
+                    it["team"] = json!({"id": "team-2", "key": "OPS"});
                     it["identifier"] = json!(format!("OPS-{n}"));
                     it["state"] = json!({"id": "ops-Todo", "name": "Todo", "type": "unstarted"});
                 }
@@ -223,14 +227,15 @@ impl Fake {
                 (200, json!({"data": {"commentCreate": {"success": true}}}))
             }
             Some("issue") => {
-                let id = vars["id"].as_str().unwrap_or_default();
-                let Some(it) = self.issues.iter().find(|i| i["id"] == id) else {
+                let named = vars["id"].as_str().unwrap_or_default();
+                let Some(it) = self.issues.iter().find(|i| i["id"] == named || i["identifier"] == named) else {
                     return (200, json!({"errors": [{"message": "Entity not found: Issue"}]}));
                 };
+                let id = it["id"].as_str().unwrap().to_string();
                 let children: Vec<Value> = self
                     .issues
                     .iter()
-                    .filter(|i| i["parent"]["id"] == id)
+                    .filter(|i| i["parent"]["id"] == id.as_str())
                     .map(|i| json!({"identifier": i["identifier"]}))
                     .collect();
                 let comments: Vec<Value> = self
@@ -243,11 +248,10 @@ impl Fake {
                                "user": {"name": "James Briggs", "displayName": c.2}})
                     })
                     .collect();
-                (
-                    200,
-                    json!({"data": {"issue": {"id": id, "description": it["description"],
-                                              "children": {"nodes": children}, "comments": {"nodes": comments}}}}),
-                )
+                let mut whole = it.clone();
+                whole["children"] = json!({"nodes": children});
+                whole["comments"] = json!({"nodes": comments});
+                (200, json!({"data": {"issue": whole}}))
             }
             _ => (200, json!({"errors": [{"message": format!("unknown query {query}")}]})),
         }
@@ -779,4 +783,115 @@ fn a_new_card_and_a_comment_go_to_linear() {
     assert_eq!(made.1["input"], json!({"title": "Ops work", "teamId": "team-2", "projectId": "proj-1"}));
     assert_eq!(project.item("lin_102").unwrap()["ref"], "OPS-102");
     assert!(board.problems().is_empty() && project.problems().is_empty());
+}
+
+/// What an agent does with Linear without a board open: look up a team, search, read, file, change and
+/// comment, with the vault's key.
+#[test]
+fn an_agent_looks_up_searches_reads_files_changes_and_comments() {
+    let (url, fake) = linear();
+    let node = node(&url, KEY, json!({}));
+
+    let team = node.run("linear.team", json!({"team": "ala"})).unwrap().result;
+    assert_eq!(team["team"], "ALA");
+    let names: Vec<&str> = team["states"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["Todo", "In Progress", "In Review", "Done", "Canceled"]);
+    assert_eq!(team["people"][0], json!({"handle": "ada", "name": "Ada Lovelace"}));
+    assert_eq!(team["labels"], json!(["Bug", "Feature"]));
+    assert_eq!(team["sprints"][0]["name"], "Cycle 41");
+    assert!(node.run("linear.team", json!({})).unwrap_err().message.contains("needs `team`"));
+
+    let projects = node.run("linear.projects", json!({})).unwrap().result;
+    assert_eq!(projects["projects"], json!([{"id": "proj-1", "name": "Spark Voice"}]));
+
+    // open issues, unless all; the latest changed first
+    let open = node.run("linear.search", json!({"team": "ALA"})).unwrap().result;
+    let refs = |r: &Value| {
+        r["issues"].as_array().unwrap().iter().map(|i| i["ref"].as_str().unwrap().to_string()).collect::<Vec<_>>()
+    };
+    assert_eq!(refs(&open), ["ALA-3", "ALA-2", "ALA-1"]);
+    assert_eq!(open["issues"][0]["owner"], "james");
+    assert!(open["text"].as_str().unwrap().starts_with("ALA-3 Issue 3 [In Review, james]"));
+    let all = node.run("linear.search", json!({"team": "ALA", "all": true, "limit": 2})).unwrap().result;
+    assert_eq!(refs(&all), ["ALA-4", "ALA-3"]);
+    let words = node.run("linear.search", json!({"query": "Issue 2"})).unwrap().result;
+    assert_eq!(refs(&words), ["ALA-2"]);
+    assert_eq!(node.run("linear.search", json!({"query": "nothing like it"})).unwrap().result["text"], "No issues");
+
+    let read = node.run("linear.issue", json!({"issue": "ALA-2"})).unwrap().result;
+    assert_eq!(
+        (read["issue"]["ref"].as_str(), read["issue"]["body"].as_str(), read["issue"]["team"].as_str()),
+        (Some("ALA-2"), Some("Steps for 2"), Some("ALA"))
+    );
+    assert!(node.run("linear.issue", json!({"issue": "ALA-999"})).unwrap_err().message.contains("Entity not found"));
+
+    // filing: the board's own checks apply, and what's wrong is said
+    let made = node
+        .run(
+            "linear.create",
+            json!({"team": "ALA", "title": "Fresh", "body": "Why", "state": "In Review", "owner": "ada",
+                   "labels": ["Bug"], "priority": "high", "target": "2026-11-01", "parent": "ALA-1"}),
+        )
+        .unwrap()
+        .result;
+    let input = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueCreate").cloned().unwrap().1["input"].clone();
+    assert_eq!(input["teamId"], "team-1");
+    assert_eq!(input["parentId"], "lin_1");
+    assert_eq!((input["assigneeId"].as_str(), input["priority"].as_i64()), (Some("u2"), Some(2)));
+    assert_eq!(made["issue"]["ref"], "ALA-101");
+    assert!(made["text"].as_str().unwrap().starts_with("Filed ALA-101 Fresh: https://"));
+    let e = node.run("linear.create", json!({"team": "ALA"})).unwrap_err();
+    assert_eq!(e.message, "linear.create needs a `title`");
+    let e = node.run("linear.create", json!({"team": "ALA", "title": "x", "state": "Nope"})).unwrap_err();
+    assert_eq!(e.message, "Nope isn't one of ALA's states");
+    let e = node.run("linear.create", json!({"team": "NOPE", "title": "x"})).unwrap_err();
+    assert!(e.message.contains("no team NOPE"), "{}", e.message);
+    // in a project, on another team
+    node.run("linear.create", json!({"team": "OPS", "title": "Ops work", "project": "spark voice"})).unwrap();
+    let input = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueCreate").cloned().unwrap().1["input"].clone();
+    assert_eq!((input["teamId"].as_str(), input["projectId"].as_str()), (Some("team-2"), Some("proj-1")));
+    let e = node.run("linear.create", json!({"team": "OPS", "title": "x", "project": "Nowhere"})).unwrap_err();
+    assert_eq!(e.message, "no open Linear project Nowhere");
+
+    // changing: only what's given; null clears
+    let changed =
+        node.run("linear.update", json!({"issue": "ALA-101", "state": "Done", "owner": null, "title": "Fresh!"}));
+    let changed = changed.unwrap().result;
+    assert_eq!(
+        (changed["issue"]["state"].as_str(), changed["issue"]["owner"].is_null(), changed["issue"]["title"].as_str()),
+        (Some("Done"), true, Some("Fresh!"))
+    );
+    let sent = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "issueUpdate").cloned().unwrap();
+    assert_eq!(sent.1["id"], "lin_101");
+    assert_eq!(sent.1["input"], json!({"stateId": "st-Done", "assigneeId": null, "title": "Fresh!"}));
+    let e = node.run("linear.update", json!({"issue": "ALA-101", "state": "Nope"})).unwrap_err();
+    assert_eq!(e.message, "Nope isn't one of ALA's states");
+    let e = node.run("linear.update", json!({"issue": "ALA-101"})).unwrap_err();
+    assert_eq!(e.message, "nothing to change");
+
+    // commenting
+    node.run("linear.comment", json!({"issue": "ALA-101", "body": "Shipped"})).unwrap();
+    let said = fake.lock().unwrap().calls.iter().rfind(|c| c.0 == "commentCreate").cloned().unwrap();
+    assert_eq!(said.1["input"], json!({"issueId": "lin_101", "body": "Shipped"}));
+    let read = node.run("linear.issue", json!({"issue": "ALA-101"})).unwrap().result;
+    assert_eq!(read["issue"]["comments"][0]["body"], "Shipped");
+    assert!(node.run("linear.comment", json!({"issue": "ALA-101"})).unwrap_err().message.contains("needs `body`"));
+}
+
+/// The key a command uses can be named; with none in the vault it says how to add one.
+#[test]
+fn an_agent_can_name_the_key_and_with_none_is_told_how_to_add_one() {
+    let (url, _fake) = linear();
+    let node = node(&url, KEY, json!({}));
+    assert!(node.run("linear.search", json!({"account": "work"})).is_ok());
+    assert!(node.run("linear.search", json!({"account": "linear.work"})).is_ok());
+    let e = node.run("linear.search", json!({"account": "other"})).unwrap_err();
+    assert_eq!(e.message, "no Linear key linear.other in the vault: linear.work");
+    let none = StandIn::new(env!("CARGO_MANIFEST_DIR"))
+        .binary(env!("CARGO_BIN_EXE_linear"))
+        .settings(json!({"api_url": url}))
+        .start()
+        .unwrap();
+    let e = none.run("linear.create", json!({"team": "ALA", "title": "x"})).unwrap_err();
+    assert_eq!(e.message, "no Linear API key in the vault: add one with /linear add");
 }

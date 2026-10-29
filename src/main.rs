@@ -10,16 +10,16 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context};
+use anyhow::{anyhow, bail, Context};
 use linear::{
-    board, by_id, issue_input, newest, project_filter, sort_between, targets, team_filter, Linear, Scope, Tracker,
-    CONTENT_MAX,
+    board, by_id, handle, issue_input, issue_lines, issue_out, newest, project_filter, search_filter, sort_between,
+    targets, team_filter, Linear, Scope, Tracker, CONTENT_MAX,
 };
 use pointman_extension::protocol::PaneOpenResponse;
 use pointman_extension::v1::PaneInput;
 use pointman_extension::{Extension, Handle, Job, Pane, Refused};
 use regex::Regex;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
 /// How often the vault's linear.* names are looked at, and how long an opened key is kept. A list older
 /// than LIST_EVERY is still used while it's asked for again behind (each ask is a round trip to core, 0.2 s
@@ -185,6 +185,45 @@ impl Boards {
         let key = key
             .with_context(|| format!("{account} isn't a Linear API key (lin_api_…): add it again with /linear add"))?;
         Ok(Linear::new(url, &key))
+    }
+
+    /// The keys a command tries: the one it names (`work` or `linear.work`), or every key in the vault.
+    fn tried(&self, job: &Job) -> anyhow::Result<Vec<String>> {
+        let all = self.accounts()?;
+        let Some(named) = text(job, "account") else { return Ok(all) };
+        let name = if named.starts_with("linear.") { named.to_string() } else { format!("linear.{named}") };
+        match all.contains(&name) {
+            true => Ok(vec![name]),
+            false => bail!("no Linear key {name} in the vault: {}", all.join(", ")),
+        }
+    }
+
+    /// Asks with each key in turn until one answers; if none does, says why each didn't.
+    fn first<T>(&self, job: &Job, ask: impl Fn(&Linear) -> anyhow::Result<T>) -> anyhow::Result<(Linear, T)> {
+        let mut refused = Vec::new();
+        for account in self.tried(job)? {
+            match self.linear(&account) {
+                Ok(linear) => match ask(&linear) {
+                    Ok(done) => return Ok((linear, done)),
+                    Err(e) => refused.push((account, e)),
+                },
+                Err(e) => refused.push((account, e)),
+            }
+        }
+        match refused.len() {
+            1 => Err(refused.pop().map(|(_, e)| e).expect("one key was tried")),
+            _ => Err(refused_by(refused, "No Linear key in the vault could do that")),
+        }
+    }
+
+    /// A team's scope (states, people, labels, sprints) by its key, with the key that sees it.
+    fn team_scope(&self, job: &Job, key: &str) -> anyhow::Result<(Linear, Scope)> {
+        self.first(job, |linear| linear.team(&key.to_uppercase()))
+    }
+
+    /// An issue by its ref (ALA-12), with the key that sees it.
+    fn issue_ref(&self, job: &Job, name: &str) -> anyhow::Result<(Linear, Value)> {
+        self.first(job, |linear| linear.find(name))
     }
 
     fn content(&self, shown: &Shown) -> Value {
@@ -463,6 +502,41 @@ impl Boards {
 }
 
 /// Why nothing opened: one key's own error as it is, or each key's after `what`.
+/// A job's text parameter, trimmed, if it has one that isn't empty.
+fn text<'a>(job: &'a Job, name: &str) -> Option<&'a str> {
+    job.params[name].as_str().map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// A parameter a command can't do without.
+fn need<'a>(job: &'a Job, name: &str) -> anyhow::Result<&'a str> {
+    text(job, name).ok_or_else(|| anyhow!("{} needs `{name}`", job.kind))
+}
+
+/// The fields of an issue a job sets, as the board's edit says them (title, body, state, owner, priority,
+/// target, estimate, labels, sprint, parent). One given as null clears it.
+fn fields_of(job: &Job) -> Map<String, Value> {
+    let set = ["title", "body", "state", "owner", "priority", "target", "estimate", "labels", "sprint", "parent"];
+    set.iter().filter_map(|f| job.params.get(*f).map(|v| (f.to_string(), v.clone()))).collect()
+}
+
+/// The issue a parent field names, as the board's input looks parents up.
+fn parents(linear: &Linear, fields: &Map<String, Value>) -> anyhow::Result<HashMap<String, Value>> {
+    let mut issues = HashMap::new();
+    if let Some(parent) = fields.get("parent").and_then(Value::as_str).map(str::trim).filter(|p| !p.is_empty()) {
+        let found = linear.find(parent)?;
+        issues.insert(found["id"].as_str().unwrap_or(parent).to_string(), found);
+    }
+    Ok(issues)
+}
+
+/// An open Linear project by its id or name.
+fn project_id(linear: &Linear, named: &str) -> anyhow::Result<Value> {
+    let projects = linear.projects()?;
+    let found =
+        projects.iter().find(|p| p["id"] == named || p["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(named)));
+    found.map(|p| p["id"].clone()).ok_or_else(|| anyhow!("no open Linear project {named}"))
+}
+
 fn refused_by(mut refused: Vec<(String, anyhow::Error)>, what: &str) -> anyhow::Error {
     if refused.len() == 1 {
         return refused.remove(0).1;
@@ -551,6 +625,151 @@ fn main() -> anyhow::Result<()> {
         }
         lines.extend(refused.iter().map(|(account, e)| format!("Couldn't ask with {account}: {e:#}")));
         Ok(json!({"targets": all, "text": lines.join("\n")}))
+    });
+
+    // what an agent does with Linear itself: look around, find, read, file, change and comment. Each asks with
+    // the vault's keys in turn (or the one `account` names), and an issue or team is found with whichever sees it.
+    let b = boards.clone();
+    ext.command("linear.team", move |job: &Job| {
+        let (_, scope) = b.team_scope(job, need(job, "team")?)?;
+        let team = &scope.teams[0];
+        let states: Vec<Value> = team.states.iter().map(|s| json!({"name": s["name"], "type": s["type"]})).collect();
+        let people: Vec<Value> =
+            scope.people().iter().map(|p| json!({"handle": handle(p), "name": p["name"]})).collect();
+        let labels: Vec<&Value> = scope.labels_for(team).map(|l| &l["name"]).collect();
+        let sprints: Vec<Value> = team
+            .cycles
+            .iter()
+            .map(|c| {
+                let name = c["name"].as_str().map(String::from).unwrap_or_else(|| format!("Cycle {}", c["number"]));
+                json!({"id": c["id"], "name": name, "start": c["startsAt"], "end": c["endsAt"]})
+            })
+            .collect();
+        let names = |v: &[Value], k: &str| v.iter().filter_map(|x| x[k].as_str()).collect::<Vec<_>>().join(", ");
+        let text = format!(
+            "{} ({}). States: {}. People: {}.",
+            team.name,
+            team.key,
+            names(&states, "name"),
+            people.iter().filter_map(|p| p["handle"].as_str()).collect::<Vec<_>>().join(", ")
+        );
+        Ok(json!({"team": team.key, "name": team.name, "states": states, "people": people, "labels": labels,
+                  "sprints": sprints, "text": text}))
+    });
+
+    let b = boards.clone();
+    ext.command("linear.projects", move |job: &Job| {
+        let (mut all, mut refused) = (Vec::<Value>::new(), Vec::new());
+        for account in b.tried(job)? {
+            match b.linear(&account).and_then(|l| l.projects()) {
+                Ok(projects) => {
+                    for p in projects {
+                        if !all.iter().any(|a| a["id"] == p["id"]) {
+                            all.push(p);
+                        }
+                    }
+                }
+                Err(e) => refused.push((account, e)),
+            }
+        }
+        if all.is_empty() && !refused.is_empty() {
+            return Err(refused_by(refused, "Linear refused every key in the vault"));
+        }
+        let names: Vec<&str> = all.iter().filter_map(|p| p["name"].as_str()).collect();
+        Ok(json!({"projects": all, "text": format!("{} open Linear projects: {}", all.len(), names.join(", "))}))
+    });
+
+    let b = boards.clone();
+    ext.command("linear.search", move |job: &Job| {
+        let filter = search_filter(
+            text(job, "query"),
+            text(job, "team"),
+            text(job, "state"),
+            text(job, "owner"),
+            text(job, "project"),
+            job.params["all"] == true,
+        );
+        let limit = job.params["limit"].as_u64().unwrap_or(25).clamp(1, 100) as usize;
+        let (mut found, mut refused) = (Vec::<Value>::new(), Vec::new());
+        for account in b.tried(job)? {
+            match b.linear(&account).and_then(|l| l.search(&filter, limit)) {
+                Ok(issues) => {
+                    for i in issues {
+                        if !found.iter().any(|f| f["id"] == i["id"]) {
+                            found.push(i);
+                        }
+                    }
+                }
+                Err(e) => refused.push((account, e)),
+            }
+        }
+        if found.is_empty() && !refused.is_empty() {
+            return Err(refused_by(refused, "Linear refused every key in the vault"));
+        }
+        found.sort_by(|a, b| b["updatedAt"].as_str().cmp(&a["updatedAt"].as_str()));
+        found.truncate(limit);
+        let issues: Vec<Value> = found.iter().map(|i| issue_out(&b.map, i)).collect();
+        Ok(json!({"issues": issues, "text": issue_lines(&issues)}))
+    });
+
+    let b = boards.clone();
+    ext.command("linear.issue", move |job: &Job| {
+        let (_, issue) = b.issue_ref(job, need(job, "issue")?)?;
+        let out = issue_out(&b.map, &issue);
+        Ok(json!({"issue": out, "text": format!("{} {} [{}]: {}", out["ref"].as_str().unwrap_or_default(),
+            out["title"].as_str().unwrap_or_default(), out["state"].as_str().unwrap_or("?"),
+            out["url"].as_str().unwrap_or_default())}))
+    });
+
+    let b = boards.clone();
+    ext.command("linear.create", move |job: &Job| {
+        let fields = fields_of(job);
+        if fields.get("title").and_then(Value::as_str).is_none_or(|t| t.trim().is_empty()) {
+            bail!("linear.create needs a `title`");
+        }
+        let (linear, scope) = b.team_scope(job, need(job, "team")?)?;
+        let team = &scope.teams[0];
+        let mut input = issue_input(&fields, &scope, team, &parents(&linear, &fields)?).map_err(|e| anyhow!(e))?;
+        input["teamId"] = json!(team.id);
+        if let Some(project) = text(job, "project") {
+            input["projectId"] = project_id(&linear, project)?;
+        }
+        let mut out = issue_out(&b.map, &linear.create(input)?);
+        out["team"] = json!(team.key);
+        let said = format!(
+            "Filed {} {}: {}",
+            out["ref"].as_str().unwrap_or_default(),
+            out["title"].as_str().unwrap_or_default(),
+            out["url"].as_str().unwrap_or_default()
+        );
+        Ok(json!({"issue": out, "text": said}))
+    });
+
+    let b = boards.clone();
+    ext.command("linear.update", move |job: &Job| {
+        let (linear, issue) = b.issue_ref(job, need(job, "issue")?)?;
+        let key = issue["team"]["key"].as_str().context("Linear didn't say which team the issue is in")?;
+        let scope = linear.team(key)?;
+        let fields = fields_of(job);
+        let input =
+            issue_input(&fields, &scope, &scope.teams[0], &parents(&linear, &fields)?).map_err(|e| anyhow!(e))?;
+        let mut out = issue_out(&b.map, &linear.update(issue["id"].as_str().unwrap_or_default(), input)?);
+        out["team"] = json!(key);
+        let said = format!(
+            "Changed {}: now {} ({})",
+            out["ref"].as_str().unwrap_or_default(),
+            out["state"].as_str().unwrap_or("?"),
+            out["url"].as_str().unwrap_or_default()
+        );
+        Ok(json!({"issue": out, "text": said}))
+    });
+
+    let b = boards.clone();
+    ext.command("linear.comment", move |job: &Job| {
+        let (linear, issue) = b.issue_ref(job, need(job, "issue")?)?;
+        let body = need(job, "body")?;
+        linear.comment(issue["id"].as_str().unwrap_or_default(), body)?;
+        Ok(json!({"text": format!("Commented on {}", issue["identifier"].as_str().unwrap_or_default())}))
     });
 
     let b = boards.clone();
