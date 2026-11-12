@@ -27,10 +27,10 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - { platform: macos-arm64, runner: macos-14, target: aarch64-apple-darwin, test: true }
-          - { platform: macos-x86_64, runner: macos-14, target: x86_64-apple-darwin, test: false }
-          - { platform: linux-x86_64, runner: ubuntu-24.04, target: x86_64-unknown-linux-musl, test: true }
-          - { platform: linux-arm64, runner: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, test: true }
+          - { platform: macos-arm64, runner: blacksmith-6vcpu-macos-15, target: aarch64-apple-darwin, test: true }
+          - { platform: macos-x86_64, runner: blacksmith-6vcpu-macos-15, target: x86_64-apple-darwin, test: false }
+          - { platform: linux-x86_64, runner: blacksmith-4vcpu-ubuntu-2404, target: x86_64-unknown-linux-musl, test: true }
+          - { platform: linux-arm64, runner: blacksmith-4vcpu-ubuntu-2404-arm, target: aarch64-unknown-linux-musl, test: true }
     runs-on: ${{ matrix.runner }}
     env:
       MACOSX_DEPLOYMENT_TARGET: "13.0"
@@ -69,7 +69,7 @@ jobs:
 
   release:
     needs: build
-    runs-on: ubuntu-24.04
+    runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/download-artifact@v4
         with:
