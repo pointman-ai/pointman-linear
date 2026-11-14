@@ -3,9 +3,11 @@
 #
 # Push a tag that's extension.toml's version (`git tag v0.7.0 && git push origin v0.7.0`): each
 # platform is built on its own runner and packed as <id>-<version>-<platform>.tar.gz, the files at
-# its top (extension.toml, bin/<id>, README.md, LICENSE). Then one job makes the release with every
-# archive attached. gh keeps it a draft until they're all up, so core's `released` delivery finds
-# each platform in `platforms`; one missing is refused.
+# its top (extension.toml, bin/<id>, README.md, LICENSE). A first job makes the tag's release
+# as a draft, each build uploads its archive to it, and a last job publishes it once they're all up,
+# so core's `released` delivery finds each platform's build; one missing is refused. The archives go
+# straight onto the release, never through Actions' artifact storage: that storage is the account's,
+# and once it's full no build can hand its archive on.
 #
 # Linux builds are musl, so static: they run on any distribution, NixOS included, whose loader
 # isn't where a glibc build looks for it. Both Macs build on macos-14, the Intel one cross-compiled
@@ -22,7 +24,18 @@ env:
   BIN: ""                 # the cargo binary's name, when it isn't the extension's id
 
 jobs:
+  draft:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - name: The tag's release, a draft until every platform's build is on it
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --json isDraft >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes --draft
+
   build:
+    needs: draft
     strategy:
       fail-fast: true
       matrix:
@@ -61,21 +74,18 @@ jobs:
           chmod 755 "pkg/bin/$ID"
           cp extension.toml README.md LICENSE pkg/
           tar -czf "$ID-$VERSION-${{ matrix.platform }}.tar.gz" -C pkg extension.toml bin README.md LICENSE
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ${{ matrix.platform }}
-          path: "*.tar.gz"
-          if-no-files-found: error
+      - name: Its archive, on the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          command -v gh >/dev/null || brew install gh
+          gh release upload "$GITHUB_REF_NAME" "$ID-$VERSION-${{ matrix.platform }}.tar.gz" --repo "$GITHUB_REPOSITORY" --clobber
 
   release:
     needs: build
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: The release, with every platform's build
+      - name: The release, published with every platform's build
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.tar.gz --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false
