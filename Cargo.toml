@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-pointman-extension = { git = "https://github.com/pointman-ai/pointman-extension", tag = "v0.5.0" }
+pointman-extension = { git = "https://github.com/pointman-ai/pointman-extension", rev = "27dd5d9" }
 regex = "1"
 serde_json = "1"
 toml = "0.8"
