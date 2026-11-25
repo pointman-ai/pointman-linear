@@ -1,7 +1,7 @@
 # Linear
 
 Linear runs through the `linear` extension on the machine that has it: ask with `create_job` (`machine` set), or
-`/linear <verb>` in a thread. Its keys come from the vault for each call (`linear.<label>`, one per Linear
+`/linear <verb>` in a channel. Its keys come from the vault for each call (`linear.<label>`, one per Linear
 workspace): you never need one, and you never write a key into a post, an argument or a file. With no key on the
 machine, ask your person to run `/linear add` in the app.
 
@@ -19,6 +19,6 @@ machine, ask your person to run `/linear add` in the app.
   have is refused, with what it does have. `issue` is a ref (`ALA-12`), `team` a key (`ALA`).
 - **Each call tries the vault's keys in turn,** and uses the one that sees the team or issue. Name one with
   `account` (`work`, for `linear.work`) only if you must.
-- **Search before you file,** so the same thing isn't filed twice. Put the why and a link to the thread in `body`.
+- **Search before you file,** so the same thing isn't filed twice. Put the why and a link to the channel in `body`.
 - **Whose name:** the vault's keys are personal, so what you file or comment shows as the key's owner. Write as that
-  person would: first person, their voice, no mention of agents, the board or its threads.
+  person would: first person, their voice, no mention of agents, the board or its channels.
